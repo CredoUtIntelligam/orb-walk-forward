@@ -15,20 +15,20 @@ the start of the minute, matching the loader's regular-hours filter.
 Two trigger rules are supported. Both use a strict comparison, so a print
 that only tags the level is not a breakout.
 
-``close`` (the default). Long when the bar closes strictly above
-``range_high``. Short when it closes strictly below ``range_low``. A wick
-through the level with the close back inside the range is not a signal.
-``entry_price`` is that close.
+``close`` (the default). Long when the bar closes strictly above the
+opening-range high. Short when it closes strictly below the opening-range
+low. A wick through the level with the close back inside the range is not
+a signal. ``entry_price`` is that close.
 
-``high_low``. Long when the bar's high trades strictly above
-``range_high``. Short when its low trades strictly below ``range_low``.
-``entry_price`` is the broken level, the reference for a stop resting
-there, not the wick extreme.
+``high_low``. Long when the bar's high trades strictly above the
+opening-range high. Short when its low trades strictly below the
+opening-range low. ``entry_price`` is the broken level, the reference for
+a stop resting there, not the wick extreme.
 
 A bar that breaks both sides under the selected rule is ambiguous and is
 skipped. Scanning continues with the next eligible bar. A close cannot be
-on both sides when ``range_high >= range_low``; breaking both sides on one
-bar is a ``high_low`` case.
+on both sides when the range high is at least the range low; breaking both
+sides on one bar is a ``high_low`` case.
 
 ``entry_price`` is a reference on the signal. It is not a fill. This
 module does not size a position, choose a stop or target, or compute P&L.
@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -64,30 +64,30 @@ __all__ = [
     "SHORT",
     "TRIGGER_CLOSE",
     "TRIGGER_HIGH_LOW",
-    "BreakoutSignal",
+    "Signal",
     "breakout_signals",
 ]
 
 
 @dataclass(frozen=True, slots=True)
-class BreakoutSignal:
+class Signal:
     """One opening-range breakout.
 
     ``session_date`` is the New York trading date. ``direction`` is
-    ``"long"`` or ``"short"``. ``timestamp`` is the start of the
-    triggering 1-minute bar, timezone-aware in America/New_York.
-    ``entry_price`` is the reference for the trigger that fired: the bar
-    close for ``"close"``, and the broken opening-range level for
-    ``"high_low"``. ``range_high`` and ``range_low`` are the levels the
-    signal was based on.
+    ``"long"`` or ``"short"``. ``or_high`` and ``or_low`` are the
+    opening-range levels the signal was based on. ``entry_ts`` is the
+    start of the triggering 1-minute bar, timezone-aware in
+    America/New_York. ``entry_price`` is the reference for the trigger
+    that fired: the bar close for ``"close"``, and the broken level
+    (``or_high`` or ``or_low``) for ``"high_low"``.
     """
 
     session_date: date
-    direction: str
-    timestamp: pd.Timestamp
+    direction: Literal["long", "short"]
+    or_high: float
+    or_low: float
+    entry_ts: pd.Timestamp
     entry_price: float
-    range_high: float
-    range_low: float
 
 
 class _RangeSession(TypedDict):
@@ -102,7 +102,7 @@ def breakout_signals(
     ranges: pd.DataFrame,
     *,
     trigger: str = DEFAULT_TRIGGER,
-) -> list[BreakoutSignal]:
+) -> list[Signal]:
     """Emit the first opening-range breakout of each session, if there is one.
 
     Parameters
@@ -131,10 +131,11 @@ def breakout_signals(
 
     Returns
     -------
-    list[BreakoutSignal]
+    list[Signal]
         Signals in session-date order. At most one per date. Days with
         no one-sided break after the window are not included. An empty
-        input returns an empty list.
+        input returns an empty list. ``or_high`` and ``or_low`` are the
+        range row's high and low. ``entry_ts`` is the triggering bar.
     """
     trigger = _validate_trigger(trigger)
     frame = _prepare_bars(bars)
@@ -143,7 +144,7 @@ def breakout_signals(
         return []
 
     by_day = _bars_by_session(frame)
-    signals: list[BreakoutSignal] = []
+    signals: list[Signal] = []
     for session in sessions:
         day = by_day.get(session["session_date"])
         if day is None or day.empty:
@@ -307,7 +308,7 @@ def _signal_for_day(
     day: pd.DataFrame,
     session: _RangeSession,
     trigger: str,
-) -> BreakoutSignal | None:
+) -> Signal | None:
     eligible = _eligible_bars(day, session["window_minutes"])
     range_high = session["range_high"]
     range_low = session["range_low"]
@@ -327,13 +328,13 @@ def _signal_for_day(
         else:
             direction = SHORT
             entry_price = short_price
-        return BreakoutSignal(
+        return Signal(
             session_date=session["session_date"],
             direction=direction,
-            timestamp=pd.Timestamp(timestamp),
+            or_high=range_high,
+            or_low=range_low,
+            entry_ts=pd.Timestamp(timestamp),
             entry_price=float(entry_price),
-            range_high=range_high,
-            range_low=range_low,
         )
     return None
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from datetime import date, time, timedelta
 
 import pandas as pd
@@ -10,7 +10,7 @@ import pytest
 
 from orb import (
     DEFAULT_TRIGGER,
-    BreakoutSignal,
+    Signal,
     breakout_signals,
     load_ohlcv,
     opening_ranges,
@@ -28,15 +28,15 @@ FIXTURE_SIGNALS = {
         "direction": LONG,
         "entry_price": 5011.0,
         "level_price": 5008.0,
-        "range_high": 5008.0,
-        "range_low": 5000.0,
+        "or_high": 5008.0,
+        "or_low": 5000.0,
     },
     date(2024, 1, 17): {
         "direction": SHORT,
         "entry_price": 5047.0,
         "level_price": 5050.0,
-        "range_high": 5058.0,
-        "range_low": 5050.0,
+        "or_high": 5058.0,
+        "or_low": 5050.0,
     },
 }
 
@@ -103,17 +103,68 @@ def _signal(
     clock: str,
     entry_price: float,
     *,
-    range_high: float = 10.0,
-    range_low: float = 6.0,
-) -> BreakoutSignal:
-    return BreakoutSignal(
+    or_high: float = 10.0,
+    or_low: float = 6.0,
+) -> Signal:
+    return Signal(
         session_date=day,
         direction=direction,
-        timestamp=pd.Timestamp(f"{day.isoformat()} {clock}", tz=NY),
+        or_high=or_high,
+        or_low=or_low,
+        entry_ts=pd.Timestamp(f"{day.isoformat()} {clock}", tz=NY),
         entry_price=entry_price,
-        range_high=range_high,
-        range_low=range_low,
     )
+
+
+def test_signal_fields_are_frozen_and_one_per_day() -> None:
+    """The public record is ``Signal``, frozen, with one row per session."""
+    assert [field.name for field in fields(Signal)] == [
+        "session_date",
+        "direction",
+        "or_high",
+        "or_low",
+        "entry_ts",
+        "entry_price",
+    ]
+    bars = pd.concat(
+        [
+            _session(
+                "2024-01-16",
+                RTH_OPEN + 15,
+                2,
+                high=[13.0, 8.0],
+                low=[9.0, 0.0],
+                close=[12.0, 1.0],
+            ),
+            _session(
+                "2024-01-17",
+                RTH_OPEN + 15,
+                1,
+                high=9.0,
+                low=8.0,
+                close=8.5,
+            ),
+        ]
+    )
+    ranges = _ranges(
+        [
+            (date(2024, 1, 16), 10.0, 6.0, 15),
+            (date(2024, 1, 17), 10.0, 6.0, 15),
+        ]
+    )
+    signals = breakout_signals(bars, ranges)
+    assert isinstance(signals, list)
+    assert len(signals) == 1
+    signal = signals[0]
+    assert isinstance(signal, Signal)
+    assert signal.direction in (LONG, SHORT)
+    assert signal.session_date == date(2024, 1, 16)
+    assert signal.or_high == 10.0
+    assert signal.or_low == 6.0
+    assert signal.entry_ts == pd.Timestamp("2024-01-16 09:45", tz=NY)
+    assert signal.entry_price == 12.0
+    with pytest.raises(FrozenInstanceError):
+        signal.entry_price = 0.0  # type: ignore[misc]
 
 
 def test_long_breakout_uses_the_first_close_above_the_high() -> None:
@@ -137,9 +188,7 @@ def test_long_breakout_uses_the_first_close_above_the_high() -> None:
     assert DEFAULT_TRIGGER == TRIGGER_CLOSE
     assert signals == breakout_signals(bars, ranges, trigger="close")
     assert signals == [_signal(date(2024, 1, 16), LONG, "09:46", 10.5)]
-    assert signals[0].timestamp.time() == time(9, 46)
-    with pytest.raises(FrozenInstanceError):
-        signals[0].direction = SHORT  # type: ignore[misc]
+    assert signals[0].entry_ts.time() == time(9, 46)
 
     pierced = breakout_signals(bars, ranges, trigger=TRIGGER_HIGH_LOW)
     assert pierced == [_signal(date(2024, 1, 16), LONG, "09:45", 10.0)]
@@ -220,6 +269,8 @@ def test_only_the_first_breakout_signals_when_both_sides_break() -> None:
         ]
     )
     signals = breakout_signals(pd.concat([short_then_long, long_then_short]), ranges)
+    assert isinstance(signals, list)
+    assert len(signals) == len({signal.session_date for signal in signals}) == 2
     assert signals == [
         _signal(date(2024, 1, 16), LONG, "09:45", 12.0),
         _signal(date(2024, 1, 17), SHORT, "09:45", 1.0),
@@ -368,8 +419,8 @@ def test_utc_timestamps_signal_on_the_new_york_clock() -> None:
         _signal(date(2024, 1, 16), LONG, "09:45", 21.0),
         _signal(date(2024, 7, 16), SHORT, "09:45", 2.0),
     ]
-    assert signals[0].timestamp.utcoffset() == timedelta(hours=-5)
-    assert signals[1].timestamp.utcoffset() == timedelta(hours=-4)
+    assert signals[0].entry_ts.utcoffset() == timedelta(hours=-5)
+    assert signals[1].entry_ts.utcoffset() == timedelta(hours=-4)
     assert str(bars.index.tz) == "UTC"
 
 
@@ -385,26 +436,27 @@ def test_fixture_emits_long_short_and_no_breakout() -> None:
     ranges = opening_ranges(bars)
     signals = breakout_signals(bars, ranges)
     assert signals == [
-        BreakoutSignal(
+        Signal(
             session_date=day,
             direction=spec["direction"],
-            timestamp=pd.Timestamp(f"{day.isoformat()} 10:00", tz=NY),
+            or_high=spec["or_high"],
+            or_low=spec["or_low"],
+            entry_ts=pd.Timestamp(f"{day.isoformat()} 10:00", tz=NY),
             entry_price=spec["entry_price"],
-            range_high=spec["range_high"],
-            range_low=spec["range_low"],
         )
         for day, spec in FIXTURE_SIGNALS.items()
     ]
     assert date(2024, 1, 18) not in [signal.session_date for signal in signals]
     for signal in signals:
+        assert isinstance(signal, Signal)
         assert isinstance(signal.session_date, date)
         assert isinstance(signal.entry_price, float)
-        assert signal.timestamp.time() == time(10, 0)
-        assert str(signal.timestamp.tz) == NY
+        assert signal.entry_ts.time() == time(10, 0)
+        assert str(signal.entry_ts.tz) == NY
 
     touched = breakout_signals(bars, ranges, trigger="high_low")
-    assert [signal.timestamp for signal in touched] == [
-        signal.timestamp for signal in signals
+    assert [signal.entry_ts for signal in touched] == [
+        signal.entry_ts for signal in signals
     ]
     assert [signal.direction for signal in touched] == [LONG, SHORT]
     assert [signal.entry_price for signal in touched] == [

@@ -54,13 +54,13 @@ A session is kept only when every minute in the window is present exactly once. 
 
 ## Breakout signals
 
-`breakout_signals` takes those bars and that range table and returns a list of `BreakoutSignal` values. Each signal has `session_date`, `direction` (`"long"` or `"short"`), `timestamp` (start of the triggering minute, America/New_York), `entry_price`, `range_high`, and `range_low`.
+`breakout_signals` takes those bars and that range table and returns a `list[Signal]`. Each `Signal` has `session_date`, `direction` (`"long"` or `"short"`), `or_high`, `or_low`, `entry_ts` (start of the triggering minute, America/New_York), and `entry_price`. At most one signal is returned per session date.
 
 A session emits at most one signal: the first eligible bar that breaks the range. Later bars that day are ignored, including a break of the other side. A session with no break is omitted. Eligible bars are minute-aligned stamps in `[09:30 + window_minutes, 16:00)` ET. Bars inside the opening-range window, and bars at or after 16:00, do not signal. `window_minutes` comes from each range row.
 
-The default trigger is `"close"`. Long means the bar closes strictly above `range_high`. Short means it closes strictly below `range_low`. A wick through the level with the close back inside the range is not a breakout. `entry_price` is that close.
+The default trigger is `"close"`. Long means the bar closes strictly above the opening-range high. Short means it closes strictly below the opening-range low. A wick through the level with the close back inside the range is not a breakout. `entry_price` is that close.
 
-`trigger="high_low"` fires when the bar's high trades strictly above `range_high`, or its low trades strictly below `range_low`. `entry_price` is the broken level, not the wick. A bar that trades through both levels is skipped, and scanning continues. Tagging a level exactly is not a break under either rule.
+`trigger="high_low"` fires when the bar's high trades strictly above the opening-range high, or its low trades strictly below the opening-range low. `entry_price` is the broken level (`or_high` or `or_low`), not the wick. A bar that trades through both levels is skipped, and scanning continues. Tagging a level exactly is not a break under either rule.
 
 `entry_price` is a reference on the signal, not a fill. The function does not size a position or compute P&L.
 

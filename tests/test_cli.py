@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import shutil
+import site
 import subprocess
 import sys
 from pathlib import Path
@@ -209,11 +210,32 @@ def test_module_and_console_script_print_the_fixture() -> None:
     assert module.returncode == 0, module.stderr
     assert json.loads(module.stdout) == EXPECTED
 
-    script = shutil.which("orb-signals")
-    assert script, "orb-signals is not on PATH; install the project scripts"
-    via_script = _run([script, "--allow-synthetic", "--format", "json"])
+    script = _console_script()
+    via_script = _run([str(script), "--allow-synthetic", "--format", "json"])
     assert via_script.returncode == 0, via_script.stderr
     assert via_script.stdout == module.stdout
+
+
+def _console_script() -> Path:
+    """Return the installed ``orb-signals`` script.
+
+    A user install places it under the user base ``bin`` directory, which
+    is not always on ``PATH``. An editable install in a virtualenv places
+    it next to the interpreter.
+    """
+    found = shutil.which("orb-signals")
+    if found:
+        return Path(found)
+    candidates = [
+        Path(sys.executable).resolve().parent / "orb-signals",
+        Path(site.getuserbase()) / "bin" / "orb-signals",
+    ]
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    raise AssertionError(
+        "orb-signals is not installed; run python -m pip install -e '.[dev]'"
+    )
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:

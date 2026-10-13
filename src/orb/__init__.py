@@ -2,6 +2,7 @@
 
 Sample-data loading, opening-range calculation, and breakout signals.
 Feed ``signal_bars(load_ohlcv(...))`` into the range and signal functions.
+``python -m orb`` and the ``orb-signals`` console script run that path.
 """
 
 from orb.breakout import DEFAULT_TRIGGER, Signal, breakout_signals

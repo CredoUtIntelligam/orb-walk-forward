@@ -17,6 +17,10 @@ Current modules:
   The default trigger is a close strictly beyond the range; `high_low`
   uses a high or low that trades strictly through the level.
   Rows flagged `early_close` are dropped when that column is present
+- `orb/cli.py` and `orb/__main__.py` — `orb-signals` and `python -m orb`.
+  They run `signal_bars(load_ohlcv(...))`, then `opening_ranges`, then
+  `breakout_signals`. The synthetic fixture needs `--allow-synthetic`.
+  Early-close sessions stay excluded
 - `orb/fixtures/` — synthetic test CSV (not real market data). Loading it
   requires `allow_synthetic=True`
 

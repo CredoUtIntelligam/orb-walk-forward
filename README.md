@@ -7,7 +7,7 @@ This repo is designed to be driven by looping Grok Bots (orchestrator + speciali
 ## Goal
 Build a robust, reproducible walk-forward framework for ORB variants (range length, entry confirmation, filters, targets/stops, etc.) using Databento data where available. Results should support the existing Vega bot's ORB research.
 
-The code in this repo is landing one piece at a time. Piece 1 is the hardened sample-data loader. Piece 2 is the opening-range calculation. Piece 3 is the breakout signal. Callers feed `signal_bars(load_ohlcv(...))` into the range and signal functions so early-close sessions never produce a signal. A small CLI is the next piece. A walk-forward optimizer, position sizing, execution, and P&L are out of scope until that core exists.
+The code in this repo is landing one piece at a time. Piece 1 is the hardened sample-data loader. Piece 2 is the opening-range calculation. Piece 3 is the breakout signal. Piece 4 is a small CLI (`python -m orb` and `orb-signals`) that runs `signal_bars(load_ohlcv(...))` into the range and signal functions so early-close sessions never produce a signal. A walk-forward optimizer, position sizing, execution, and P&L stay out of scope.
 
 ## Package layout
 
@@ -15,6 +15,8 @@ The installable package is `orb`, in `src/orb/` (src layout). `src/__init__.py` 
 
 ```
 src/orb/__init__.py
+src/orb/__main__.py
+src/orb/cli.py
 src/orb/loader.py
 src/orb/opening_range.py
 src/orb/breakout.py
@@ -23,6 +25,7 @@ src/orb/fixtures/README.md
 tests/test_loader.py
 tests/test_opening_range.py
 tests/test_breakout.py
+tests/test_cli.py
 pyproject.toml
 ```
 
@@ -84,6 +87,22 @@ The default trigger is `"close"`. Long means the bar closes strictly above the o
 
 Early-close sessions are excluded from signals. The recommended path is `load_ohlcv`, then `signal_bars`, then `opening_ranges`, then `breakout_signals`. When the bar frame still has an `early_close` column, `breakout_signals` drops rows where that flag is true before it scans. There is no parameter that puts those sessions back.
 
+## CLI
+
+`python -m orb` and the `orb-signals` console script (from `[project.scripts]`, available after install) run that path and print the `list[Signal]`.
+
+The default input is the bundled synthetic fixture. `load_ohlcv` refuses that content unless `--allow-synthetic` is set, which is passed through as `allow_synthetic=True`. `--data` selects another local CSV or Parquet file. A renamed copy of the fixture is still refused without the flag, because the check is the loader's content checksum, not the file name.
+
+`--window` is the opening-range length in minutes (default 15). Early-close sessions stay excluded; the CLI always calls `signal_bars` and has no flag that puts them back. Stdout is a readable table or JSON (`--format table` or `--format json`). `--out` writes a file instead of stdout, CSV or JSON by the extension.
+
+Loader failures, including a missing path and a refused synthetic file, print a one-line error and exit nonzero. The command does not size a position, choose an exit, or compute P&L.
+
+```bash
+python -m orb --allow-synthetic
+python -m orb --allow-synthetic --format json
+orb-signals --data path/to/ohlcv.csv --window 15 --out signals.csv
+```
+
 ## Tests
 
 ```bash
@@ -92,7 +111,7 @@ pytest
 ```
 
 ## Structure
-- `src/orb/` — Installable package. Sample-data loader, opening-range calculation, breakout signals, and synthetic fixture.
+- `src/orb/` — Installable package. Sample-data loader, opening-range calculation, breakout signals, a small CLI, and synthetic fixture.
 - `notebooks/` — Exploratory analysis and result visualization.
 - `results/` — Walk-forward outputs (CSV, plots, summaries). Gitignored large files.
 - `templates/` — Bot descriptions, prompt examples, and orchestration notes.

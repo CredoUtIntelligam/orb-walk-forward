@@ -3,17 +3,21 @@
 Installable package: `orb` in `src/orb/` (src layout).
 
 `src/__init__.py` is only a marker from the original skeleton. It is not the
-package setuptools installs. Import with `from orb import load_ohlcv, opening_ranges, breakout_signals`.
+package setuptools installs. Import with
+`from orb import load_ohlcv, signal_bars, opening_ranges, breakout_signals`.
 
 Current modules:
 
-- `orb/loader.py` — read a local Databento-style OHLCV-1m CSV into a
-  New York-indexed DataFrame
+- `orb/loader.py` — read a local Databento-style OHLCV-1m CSV or Parquet
+  file into a New York-indexed DataFrame (CME equity RTH, gap report,
+  `early_close`, and `signal_bars`)
 - `orb/opening_range.py` — opening-range high/low for a configurable RTH
   window, skipping sessions that do not contain every window minute
 - `orb/breakout.py` — first post-window breakout of each session.
   The default trigger is a close strictly beyond the range; `high_low`
-  uses a high or low that trades strictly through the level
-- `orb/fixtures/` — synthetic test CSV (not real market data)
+  uses a high or low that trades strictly through the level.
+  Rows flagged `early_close` are dropped when that column is present
+- `orb/fixtures/` — synthetic test CSV (not real market data). Loading it
+  requires `allow_synthetic=True`
 
 Walk-forward code is not in this package yet.

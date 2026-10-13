@@ -7,7 +7,7 @@ This repo is designed to be driven by looping Grok Bots (orchestrator + speciali
 ## Goal
 Build a robust, reproducible walk-forward framework for ORB variants (range length, entry confirmation, filters, targets/stops, etc.) using Databento data where available. Results should support the existing Vega bot's ORB research.
 
-The code in this repo is landing one piece at a time. Piece 1 is the sample-data loader. Piece 2 is the opening-range calculation. Piece 3, below, is the breakout signal. A small CLI is the next piece. A walk-forward optimizer, position sizing, execution, and P&L are out of scope until that core exists.
+The code in this repo is landing one piece at a time. Piece 1 is the hardened sample-data loader. Piece 2 is the opening-range calculation. Piece 3 is the breakout signal. Callers feed `signal_bars(load_ohlcv(...))` into the range and signal functions so early-close sessions never produce a signal. A small CLI is the next piece. A walk-forward optimizer, position sizing, execution, and P&L are out of scope until that core exists.
 
 ## Package layout
 
@@ -26,23 +26,39 @@ tests/test_breakout.py
 pyproject.toml
 ```
 
-Python 3.10+. Runtime dependencies are pandas and tzdata. pytest is installed with the package so the test suite runs without the Databento SDK or an API key.
+Python 3.10+. Runtime dependencies are pandas, numpy, pyarrow, tzdata, and pinned `pandas-market-calendars==5.5.0` with `exchange-calendars==4.13.2`. pytest is a dev extra, not a runtime dependency. The test suite does not need the Databento SDK or an API key.
 
 ## Sample-data loader
 
-`load_ohlcv` reads a local Databento OHLCV-1m CSV (Parquet only if a local engine such as pyarrow is already installed). It does not download anything.
+`load_ohlcv` reads a local Databento OHLCV-1m CSV or Parquet file. It does not download anything.
 
-`ts_event` is UTC, either ISO-8601 text or integer nanoseconds. The frame is indexed by timezone-aware `America/New_York` timestamps, so daylight saving time follows the IANA timezone. OHLC columns are floats and `volume` is int. Pass `symbol` to keep one instrument. Pass `rth_only=True` to keep bars in `[09:30, 16:00)` ET. 16:00 is exclusive because these bars are stamped at the start of the minute; the last regular-hours bar starts at 15:59.
+`ts_event` must be UTC: ISO-8601 text with an explicit `Z` or `+00:00` offset, or integer nanoseconds. Naive timestamps, non-UTC offsets, mixed offsets, and non-integer digit-like strings are rejected. The frame is indexed by timezone-aware `America/New_York` timestamps, so daylight saving time follows the IANA timezone. OHLC columns are floats and `volume` is int. Bars with a non-finite or non-positive price, `high < low`, an open or close outside `[low, high]`, or a negative volume are rejected. A repeated symbol and timestamp raises unless `drop_duplicates=True`.
+
+Pass `symbol` to keep one instrument. Pass `rth_only=True` to keep CME equity regular trading hours: `[09:30, 16:00)` ET on a full session, using the `CME_Equity` calendar for weekends, full holidays, and early closes. 16:00 is exclusive because these bars are stamped at the start of the minute; the last full-session bar starts at 15:59. An earlier exchange halt shortens that window. Missing minutes inside a session are reported (`rth_gap_before` and `rth_gap_report`) and are never filled.
+
+Holiday short sessions, when futures still trade a shortened day (July 4, Thanksgiving, MLK Day, and other CME equity halts before 16:00 ET), are early closes. They are flagged on `early_close`, stay in the loaded frame, and stay eligible for the gap report. `signal_bars` always removes them. That exclusion is fixed; there is no switch to include early-close sessions in signals.
 
 ```python
-from orb import breakout_signals, load_ohlcv, opening_ranges, sample_fixture_path
+from orb import (
+    breakout_signals,
+    load_ohlcv,
+    opening_ranges,
+    sample_fixture_path,
+    signal_bars,
+)
 
-bars = load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=True)
-ranges = opening_ranges(bars, window_minutes=15)
-signals = breakout_signals(bars, ranges)
+bars = load_ohlcv(
+    sample_fixture_path(),
+    symbol="MES",
+    rth_only=True,
+    allow_synthetic=True,
+)
+eligible = signal_bars(bars)
+ranges = opening_ranges(eligible, window_minutes=15)
+signals = breakout_signals(eligible, ranges)
 ```
 
-`src/orb/fixtures/SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv` is synthetic test data: three fabricated MES regular-hours sessions shaped so an opening-range check can see a long breakout, a short breakout, and a day with no breakout. It is not real market data. Do not compute performance from it. See `src/orb/fixtures/README.md`.
+`src/orb/fixtures/SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv` is synthetic test data: three fabricated MES regular-hours sessions shaped so an opening-range check can see a long breakout, a short breakout, and a day with no breakout. It is not real market data. Do not compute performance from it. `load_ohlcv` recognizes that content by a checksum of the normalized rows, not by the file name, and raises unless `allow_synthetic=True`. A renamed copy or a Parquet conversion of the same bars is refused the same way. See `src/orb/fixtures/README.md`.
 
 ## Opening range
 
@@ -51,6 +67,8 @@ signals = breakout_signals(bars, ranges)
 The window starts at 09:30 ET. `window_minutes` defaults to 15 and can be 5, 30, or any other positive length that ends at or before 16:00 ET. Stamps are the start of the minute, so a 15-minute range uses the bars from 09:30 through 09:44 inclusive (`[09:30, 09:45)`). `range_high` is the max high in that window and `range_low` is the min low. Other zones are converted to America/New_York first. Naive timestamps are rejected.
 
 A session is kept only when every minute in the window is present exactly once. A missing minute, a duplicate stamp, or a sub-minute timestamp inside the window drops that day. Bars outside the window, including 09:29 and the 16:00 bar, are ignored. Pass one symbol; a frame that still contains more than one symbol is rejected so two instruments are not blended into one range.
+
+Build ranges from `signal_bars(load_ohlcv(...))` when they will feed breakout signals. `opening_ranges` itself does not drop `early_close` rows, so an unfiltered frame can still produce a range for a holiday short session. Those ranges should not be paired with the unfiltered bars if the goal is a signal.
 
 ## Breakout signals
 
@@ -64,10 +82,12 @@ The default trigger is `"close"`. Long means the bar closes strictly above the o
 
 `entry_price` is a reference on the signal, not a fill. The function does not size a position or compute P&L.
 
+Early-close sessions are excluded from signals. The recommended path is `load_ohlcv`, then `signal_bars`, then `opening_ranges`, then `breakout_signals`. When the bar frame still has an `early_close` column, `breakout_signals` drops rows where that flag is true before it scans. There is no parameter that puts those sessions back.
+
 ## Tests
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[dev]"
 pytest
 ```
 

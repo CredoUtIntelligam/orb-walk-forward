@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import inspect
 from dataclasses import FrozenInstanceError, fields
 from datetime import date, time, timedelta
 
@@ -15,6 +17,7 @@ from orb import (
     load_ohlcv,
     opening_ranges,
     sample_fixture_path,
+    signal_bars,
 )
 from orb.breakout import LONG, SHORT, TRIGGER_CLOSE, TRIGGER_HIGH_LOW
 
@@ -430,9 +433,17 @@ def test_fixture_emits_long_short_and_no_breakout() -> None:
     2024-01-16 closes above its range, 2024-01-17 closes below its range,
     and 2024-01-18 stays inside. The 09:31 bar that prints the range extreme
     is inside the window, so it is not the signal. Non-RTH bars and input
-    order do not change the result.
+    order do not change the result. The load uses ``allow_synthetic=True``
+    and the recommended path ``signal_bars`` then ``opening_ranges``.
     """
-    bars = load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=True)
+    loaded = load_ohlcv(
+        sample_fixture_path(),
+        symbol="MES",
+        rth_only=True,
+        allow_synthetic=True,
+    )
+    bars = signal_bars(loaded)
+    assert not bool(bars["early_close"].any())
     ranges = opening_ranges(bars)
     signals = breakout_signals(bars, ranges)
     assert signals == [
@@ -463,7 +474,14 @@ def test_fixture_emits_long_short_and_no_breakout() -> None:
         spec["level_price"] for spec in FIXTURE_SIGNALS.values()
     ]
 
-    full = load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=False)
+    full = load_ohlcv(
+        sample_fixture_path(),
+        symbol="MES",
+        rth_only=False,
+        allow_synthetic=True,
+    )
+    eligible = signal_bars(full)
+    assert breakout_signals(eligible, opening_ranges(eligible)) == signals
     assert breakout_signals(full, opening_ranges(full)) == signals
     assert breakout_signals(bars.iloc[::-1], ranges) == signals
 
@@ -544,3 +562,130 @@ def test_window_minutes_rejects_non_integers() -> None:
     ranges["window_minutes"] = 15.0
     with pytest.raises(TypeError, match="int"):
         breakout_signals(bars, ranges)
+
+
+def test_bundled_fixture_requires_allow_synthetic() -> None:
+    """The synthetic fixture is refused unless the caller opts in."""
+    with pytest.raises(ValueError, match="allow_synthetic"):
+        load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=True)
+
+
+def test_breakout_drops_rows_flagged_early_close() -> None:
+    """A flagged early-close day does not signal, even when it would break.
+
+    ``opening_ranges`` still sees that day. ``breakout_signals`` applies
+    ``signal_bars`` when the column is present, so the day is omitted.
+    There is no parameter that puts it back.
+    """
+    assert "include_early_close" not in inspect.signature(breakout_signals).parameters
+    assert list(inspect.signature(signal_bars).parameters) == ["bars"]
+
+    early = _breakout_day("2024-01-16")
+    early["early_close"] = True
+    regular = _breakout_day("2024-01-17")
+    regular["early_close"] = False
+    bars = pd.concat([early, regular])
+    before = bars.copy()
+    ranges = opening_ranges(bars)
+    assert ranges["session_date"].tolist() == [date(2024, 1, 16), date(2024, 1, 17)]
+
+    signals = breakout_signals(bars, ranges)
+    assert signals == [_signal(date(2024, 1, 17), LONG, "09:45", 11.0)]
+    pd.testing.assert_frame_equal(bars, before)
+
+    plain = bars.drop(columns=["early_close"])
+    without_flag = breakout_signals(plain, opening_ranges(plain))
+    assert [signal.session_date for signal in without_flag] == [
+        date(2024, 1, 16),
+        date(2024, 1, 17),
+    ]
+
+
+def test_recommended_path_emits_no_signal_on_early_close_sessions(tmp_path) -> None:
+    """load → signal_bars → opening_ranges → breakout_signals skips the halt.
+
+    2024-07-03 is a CME equity early close (halt before 16:00 ET) with a
+    complete 15-minute opening range and a later close beyond it. 2024-07-05
+    is a full session with the same shape. Only the full session signals.
+    """
+    path = tmp_path / "early-close-breakout.csv"
+    _write_breakout_csv(
+        path,
+        [_breakout_row(day, minute) for day in ("2024-07-03", "2024-07-05") for minute in range(16)],
+    )
+    loaded = load_ohlcv(path, symbol="MES", rth_only=True)
+    july3 = _on_day(loaded, "2024-07-03")
+    july5 = _on_day(loaded, "2024-07-05")
+    assert not july3.empty
+    assert bool(july3["early_close"].all())
+    assert not bool(july5["early_close"].any())
+
+    eligible = signal_bars(loaded)
+    assert _on_day(eligible, "2024-07-03").empty
+    ranges = opening_ranges(eligible)
+    assert ranges["session_date"].tolist() == [date(2024, 7, 5)]
+    signals = breakout_signals(eligible, ranges)
+    assert signals == [_signal(date(2024, 7, 5), LONG, "09:45", 11.0)]
+
+    raw_ranges = opening_ranges(loaded)
+    assert date(2024, 7, 3) in set(raw_ranges["session_date"])
+    assert [signal.session_date for signal in breakout_signals(loaded, raw_ranges)] == [
+        date(2024, 7, 5)
+    ]
+
+
+def _breakout_day(day: str) -> pd.DataFrame:
+    """16 RTH minutes: a 15-minute range, then a close above that high."""
+    return _session(
+        day,
+        RTH_OPEN,
+        16,
+        high=[10.0] * 15 + [12.0],
+        low=[6.0] * 15 + [8.0],
+        close=[8.0] * 15 + [11.0],
+    )
+
+
+def _breakout_row(day: str, offset: int) -> dict[str, object]:
+    stamp = pd.Timestamp(f"{day} 09:30", tz=NY) + pd.Timedelta(minutes=offset)
+    utc = stamp.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%S") + ".000000000Z"
+    if offset < 15:
+        high, low, close = 10.0, 6.0, 8.0
+    else:
+        high, low, close = 12.0, 8.0, 11.0
+    return {
+        "ts_event": utc,
+        "rtype": 33,
+        "publisher_id": 1,
+        "instrument_id": 9000001,
+        "open": 8.0,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": 10,
+        "symbol": "MES",
+    }
+
+
+def _write_breakout_csv(path, rows: list[dict[str, object]]) -> None:
+    fieldnames = [
+        "ts_event",
+        "rtype",
+        "publisher_id",
+        "instrument_id",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "symbol",
+    ]
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _on_day(frame: pd.DataFrame, day: str) -> pd.DataFrame:
+    start = pd.Timestamp(day, tz=NY)
+    return frame.loc[(frame.index >= start) & (frame.index < start + pd.Timedelta(days=1))]

@@ -16,16 +16,16 @@ dependencies = [
     "pyarrow>=14",
     "tzdata>=2024.1",
 ]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
 ]
 
 [tool.setuptools.packages.find]

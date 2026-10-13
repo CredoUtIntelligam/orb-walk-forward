@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import csv
+import inspect
 from datetime import time, timedelta
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from orb import load_ohlcv, sample_fixture_path
+from orb import load_ohlcv, rth_gap_report, sample_fixture_path, signal_bars
 
 COLUMNS = [
     "ts_event",
@@ -39,14 +40,29 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _utc(ny_stamp: str) -> str:
+    """Format a New York wall time as explicit UTC ISO-8601 text."""
+    stamp = pd.Timestamp(ny_stamp, tz="America/New_York").tz_convert("UTC")
+    return stamp.strftime("%Y-%m-%dT%H:%M:%S") + ".000000000Z"
+
+
+def _on(frame: pd.DataFrame, day: str) -> pd.DataFrame:
+    start = pd.Timestamp(day, tz="America/New_York")
+    return frame.loc[(frame.index >= start) & (frame.index < start + pd.Timedelta(days=1))]
+
+
+def _clocks(frame: pd.DataFrame) -> list[tuple[int, int]]:
+    return [(stamp.hour, stamp.minute) for stamp in frame.index]
+
+
 def _bar(
     ts_event: str,
     *,
     symbol: str = "MES",
-    open_: float = 5000.0,
-    high: float = 5001.0,
-    low: float = 4999.0,
-    close: float = 5000.5,
+    open_: float = 100.0,
+    high: float = 1000.0,
+    low: float = 0.0,
+    close: float = 100.0,
     volume: int = 10,
 ) -> dict[str, object]:
     return {
@@ -71,7 +87,7 @@ def test_fixture_columns_and_dtypes() -> None:
     assert "SYNTHETIC TEST DATA" in readme
     assert "not a Databento download" in readme
 
-    frame = load_ohlcv(path)
+    frame = load_ohlcv(path, allow_synthetic=True)
     assert list(frame.columns[:6]) == [
         "open",
         "high",
@@ -97,6 +113,9 @@ def test_fixture_columns_and_dtypes() -> None:
     assert frame.index.min() < opening
     assert opening in frame.index
     assert int(frame.loc[[opening], "volume"].iloc[0]) > 0
+    assert not bool(frame["early_close"].any())
+    assert int(frame["rth_gap_before"].max()) == 0
+    assert rth_gap_report(frame).empty
 
 
 def test_timezone_conversion_handles_dst(tmp_path: Path) -> None:
@@ -169,7 +188,7 @@ def test_rth_filter_uses_new_york_clock(tmp_path: Path) -> None:
     full = load_ohlcv(path, rth_only=False)
     assert len(full) == len(rows)
 
-    fixture = load_ohlcv(sample_fixture_path(), rth_only=True)
+    fixture = load_ohlcv(sample_fixture_path(), rth_only=True, allow_synthetic=True)
     assert pd.Timestamp("2024-01-16 09:29", tz="America/New_York") not in fixture.index
     assert pd.Timestamp("2024-01-16 09:30", tz="America/New_York") in fixture.index
     assert pd.Timestamp("2024-01-16 15:59", tz="America/New_York") in fixture.index
@@ -221,7 +240,12 @@ def test_missing_column_raises(tmp_path: Path) -> None:
 
 def test_fixture_covers_long_short_and_no_breakout_days() -> None:
     """Shape only: the synthetic sessions can host a later opening-range check."""
-    frame = load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=True)
+    frame = load_ohlcv(
+        sample_fixture_path(),
+        symbol="MES",
+        rth_only=True,
+        allow_synthetic=True,
+    )
     assert [str(day) for day in sorted(set(frame.index.date))] == list(SCENARIOS)
 
     for day, spec in SCENARIOS.items():
@@ -255,3 +279,404 @@ def test_fixture_covers_long_short_and_no_breakout_days() -> None:
         else:
             assert after_ten["low"].min() < spec["or_low"]
             assert after_ten["high"].max() < spec["or_high"]
+
+
+def test_synthetic_fixture_requires_explicit_opt_in(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="allow_synthetic"):
+        load_ohlcv(sample_fixture_path())
+
+    loaded = load_ohlcv(sample_fixture_path(), allow_synthetic=True)
+    assert not loaded.empty
+
+    copied = tmp_path / sample_fixture_path().name
+    copied.write_bytes(sample_fixture_path().read_bytes())
+    with pytest.raises(ValueError, match="allow_synthetic"):
+        load_ohlcv(copied)
+    assert not load_ohlcv(copied, allow_synthetic=True).empty
+
+
+def test_duplicate_symbol_timestamp_raises_unless_dropped(tmp_path: Path) -> None:
+    path = tmp_path / "dups.csv"
+    stamp = "2024-01-16T14:30:00.000000000Z"
+    later = "2024-01-16T14:31:00.000000000Z"
+    _write_csv(
+        path,
+        [
+            _bar(stamp, symbol="MES", close=1),
+            _bar(stamp, symbol="ES", close=20),
+            _bar(stamp, symbol="MES", close=2),
+            _bar(later, symbol="MES", close=3),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="Duplicate bars"):
+        load_ohlcv(path)
+    with pytest.raises(ValueError, match="Duplicate bars"):
+        load_ohlcv(path, symbol="MES")
+
+    other = load_ohlcv(path, symbol="ES")
+    assert list(other["close"]) == [20.0]
+
+    kept = load_ohlcv(path, drop_duplicates=True)
+    mes = kept[kept["symbol"] == "MES"]
+    assert list(mes["close"]) == [1.0, 3.0]
+    assert mes.index.is_unique
+
+
+def test_rth_gaps_are_reported_per_session_and_not_filled(tmp_path: Path) -> None:
+    path = tmp_path / "gaps.csv"
+    rows = [
+        _bar(_utc("2024-01-16 09:30"), symbol="MES", close=1),
+        _bar(_utc("2024-01-16 09:31"), symbol="MES", close=2),
+        _bar(_utc("2024-01-16 09:33"), symbol="MES", close=3),
+        _bar(_utc("2024-01-16 09:30"), symbol="ES", close=4),
+        _bar(_utc("2024-01-16 09:31"), symbol="ES", close=5),
+        _bar(_utc("2024-01-16 09:32"), symbol="ES", close=6),
+        _bar(_utc("2024-01-17 09:30"), symbol="MES", close=7),
+    ]
+    _write_csv(path, rows)
+
+    frame = load_ohlcv(path, rth_only=True)
+    assert len(frame) == len(rows)
+    hole = pd.Timestamp("2024-01-16 09:32", tz="America/New_York")
+    mes = frame[frame["symbol"] == "MES"]
+    assert hole not in mes.index
+    mes_jan16 = _on(mes, "2024-01-16")
+    assert _clocks(mes_jan16) == [(9, 30), (9, 31), (9, 33)]
+    assert list(mes_jan16["rth_gap_before"]) == [0, 0, 1]
+
+    gaps = rth_gap_report(frame)
+    mes_hole = gaps[
+        (gaps["symbol"] == "MES")
+        & (gaps["session"] == "2024-01-16")
+        & (gaps["start"] == hole)
+    ]
+    assert len(mes_hole) == 1
+    assert int(mes_hole["missing_minutes"].iloc[0]) == 1
+    assert mes_hole["end"].iloc[0] == hole + pd.Timedelta(minutes=1)
+
+    es_hole = gaps[(gaps["symbol"] == "ES") & (gaps["start"] == hole)]
+    assert es_hole.empty
+
+    jan17 = gaps[(gaps["symbol"] == "MES") & (gaps["session"] == "2024-01-17")]
+    assert jan17["start"].iloc[0] == pd.Timestamp("2024-01-17 09:31", tz="America/New_York")
+    assert jan17["end"].iloc[0] == pd.Timestamp("2024-01-17 16:00", tz="America/New_York")
+    assert "2024-01-16" not in set(jan17["session"])
+
+
+def test_rejects_high_below_low(tmp_path: Path) -> None:
+    path = tmp_path / "high.csv"
+    _write_csv(path, [_bar("2024-01-16T14:30:00.000000000Z", high=4990.0, low=5000.0)])
+    with pytest.raises(ValueError, match="high is below low"):
+        load_ohlcv(path)
+
+
+@pytest.mark.parametrize(
+    ("open_", "close"),
+    [(5002.0, 5000.5), (4998.0, 5000.5)],
+)
+def test_rejects_open_outside_low_high(tmp_path: Path, open_: float, close: float) -> None:
+    path = tmp_path / "open.csv"
+    _write_csv(
+        path,
+        [
+            _bar(
+                "2024-01-16T14:30:00.000000000Z",
+                open_=open_,
+                high=5001.0,
+                low=4999.0,
+                close=close,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match=r"open is outside \[low, high\]"):
+        load_ohlcv(path)
+
+
+@pytest.mark.parametrize(
+    ("open_", "close"),
+    [(5000.0, 5002.0), (5000.0, 4998.0)],
+)
+def test_rejects_close_outside_low_high(tmp_path: Path, open_: float, close: float) -> None:
+    path = tmp_path / "close.csv"
+    _write_csv(
+        path,
+        [
+            _bar(
+                "2024-01-16T14:30:00.000000000Z",
+                open_=open_,
+                high=5001.0,
+                low=4999.0,
+                close=close,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match=r"close is outside \[low, high\]"):
+        load_ohlcv(path)
+
+
+def test_ohlc_bounds_are_inclusive(tmp_path: Path) -> None:
+    path = tmp_path / "bounds.csv"
+    _write_csv(
+        path,
+        [
+            _bar(
+                "2024-01-16T14:30:00.000000000Z",
+                open_=4999.0,
+                high=5001.0,
+                low=4999.0,
+                close=5001.0,
+            )
+        ],
+    )
+    frame = load_ohlcv(path)
+    assert frame.iloc[0]["open"] == 4999.0
+    assert frame.iloc[0]["close"] == 5001.0
+
+
+def test_rejects_negative_volume(tmp_path: Path) -> None:
+    path = tmp_path / "volume.csv"
+    _write_csv(path, [_bar("2024-01-16T14:30:00.000000000Z", volume=-1)])
+    with pytest.raises(ValueError, match="non-negative"):
+        load_ohlcv(path)
+
+
+def test_rth_uses_cme_calendar_for_holidays_weekends_and_early_halts(
+    tmp_path: Path,
+) -> None:
+    """CME equity sessions, not the NYSE holiday list.
+
+    Christmas 2024 and Saturdays are closed. Good Friday 2024 halts at
+    09:15 ET, so the 09:30 bar is outside RTH. July 4 2024 is an early
+    close on CME_Equity (the cash equity market is shut that day).
+    """
+    path = tmp_path / "calendar.csv"
+    rows = [
+        _bar(_utc("2024-12-25 09:30"), close=1),
+        _bar(_utc("2024-12-25 15:59"), close=2),
+        _bar(_utc("2024-01-13 09:30"), close=3),
+        _bar(_utc("2024-03-29 09:30"), close=4),
+        _bar(_utc("2024-07-04 09:30"), close=5),
+        _bar(_utc("2024-07-05 09:30"), close=6),
+    ]
+    _write_csv(path, rows)
+
+    rth = load_ohlcv(path, rth_only=True)
+    assert _clocks(rth) == [(9, 30), (9, 30)]
+    assert [str(stamp.date()) for stamp in rth.index] == ["2024-07-04", "2024-07-05"]
+    assert _on(rth, "2024-12-25").empty
+    assert _on(rth, "2024-01-13").empty
+    assert _on(rth, "2024-03-29").empty
+
+    raw = load_ohlcv(path)
+    good_friday = _on(raw, "2024-03-29")
+    assert bool(good_friday["early_close"].all())
+    assert _on(signal_bars(raw), "2024-03-29").empty
+    christmas = _on(raw, "2024-12-25")
+    assert not bool(christmas["early_close"].any())
+
+
+def test_early_close_sessions_are_flagged_and_excluded_from_signals(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "early.csv"
+    rows = [
+        _bar(_utc("2024-07-03 09:30"), close=1),
+        _bar(_utc("2024-07-03 12:59"), close=2),
+        _bar(_utc("2024-07-03 13:00"), close=3),
+        _bar(_utc("2024-07-03 15:00"), close=4),
+        _bar(_utc("2024-07-04 09:30"), close=5),
+        _bar(_utc("2024-07-04 13:00"), close=6),
+        _bar(_utc("2024-07-05 09:30"), close=7),
+        _bar(_utc("2024-07-05 15:59"), close=8),
+        _bar(_utc("2024-07-05 16:00"), close=9),
+    ]
+    _write_csv(path, rows)
+
+    assert "include_early_close" not in inspect.signature(load_ohlcv).parameters
+    assert "exclude_early_close" not in inspect.signature(load_ohlcv).parameters
+    assert list(inspect.signature(signal_bars).parameters) == ["bars"]
+
+    rth = load_ohlcv(path, rth_only=True)
+    assert _clocks(_on(rth, "2024-07-03")) == [(9, 30), (12, 59)]
+    assert bool(_on(rth, "2024-07-03")["early_close"].all())
+    assert bool(_on(rth, "2024-07-04")["early_close"].all())
+    assert _clocks(_on(rth, "2024-07-04")) == [(9, 30)]
+    assert _clocks(_on(rth, "2024-07-05")) == [(9, 30), (15, 59)]
+    assert not bool(_on(rth, "2024-07-05")["early_close"].any())
+
+    signals = signal_bars(rth)
+    assert _on(signals, "2024-07-03").empty
+    assert _on(signals, "2024-07-04").empty
+    assert _clocks(_on(signals, "2024-07-05")) == [(9, 30), (15, 59)]
+    assert not bool(signals["early_close"].any())
+
+    gaps = rth_gap_report(rth)
+    july3 = gaps[gaps["session"] == "2024-07-03"]
+    thirteen = pd.Timestamp("2024-07-03 13:00", tz="America/New_York")
+    assert (july3["start"] == pd.Timestamp("2024-07-03 09:31", tz="America/New_York")).any()
+    assert not bool((july3["start"] >= thirteen).any())
+    assert july3["end"].max() <= thirteen
+
+
+def test_missing_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        load_ohlcv(tmp_path / "missing.csv")
+
+
+def test_unsupported_file_type_raises(tmp_path: Path) -> None:
+    path = tmp_path / "bars.txt"
+    path.write_text("ts_event\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported file type"):
+        load_ohlcv(path)
+
+
+def test_parquet_roundtrip_and_timestamp_index(tmp_path: Path) -> None:
+    rows = [
+        _bar("2024-01-16T14:30:00.000000000Z", close=1),
+        _bar("2024-07-16T13:30:00.000000000Z", close=2),
+    ]
+    frame = pd.DataFrame(rows)
+    frame["ts_event"] = pd.to_datetime(frame["ts_event"], utc=True, format="ISO8601")
+    column_path = tmp_path / "column.parquet"
+    frame.to_parquet(column_path, index=False)
+    loaded = load_ohlcv(column_path)
+    assert loaded.index[0] == pd.Timestamp("2024-01-16 09:30", tz="America/New_York")
+    assert loaded.index[1] == pd.Timestamp("2024-07-16 09:30", tz="America/New_York")
+    assert list(loaded["close"]) == [1.0, 2.0]
+    assert loaded["volume"].dtype == "int64"
+
+    indexed = frame.set_index("ts_event")
+    index_path = tmp_path / "index.parquet"
+    indexed.to_parquet(index_path)
+    from_index = load_ohlcv(index_path)
+    assert from_index.index[0] == loaded.index[0]
+    assert list(from_index["close"]) == [1.0, 2.0]
+
+
+def test_parquet_import_error_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "bars.parquet"
+    path.write_bytes(b"")
+
+    def _boom(*_args, **_kwargs):
+        raise ImportError("no engine")
+
+    monkeypatch.setattr("orb.loader.pd.read_parquet", _boom)
+    with pytest.raises(ImportError, match="pyarrow"):
+        load_ohlcv(path)
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low", "close", "volume"])
+def test_blank_values_raise(tmp_path: Path, column: str) -> None:
+    path = tmp_path / "blank.csv"
+    row = _bar("2024-01-16T14:30:00.000000000Z")
+    row[column] = ""
+    _write_csv(path, [row])
+    with pytest.raises(ValueError, match="missing values"):
+        load_ohlcv(path)
+
+
+def test_blank_timestamp_raises(tmp_path: Path) -> None:
+    path = tmp_path / "blank-ts.csv"
+    row = _bar("")
+    _write_csv(path, [row])
+    with pytest.raises(ValueError, match="missing timestamps"):
+        load_ohlcv(path)
+
+
+def test_fractional_volume_raises(tmp_path: Path) -> None:
+    path = tmp_path / "fraction.csv"
+    _write_csv(path, [_bar("2024-01-16T14:30:00.000000000Z", volume=1.5)])
+    with pytest.raises(ValueError, match="whole number"):
+        load_ohlcv(path)
+
+
+def test_naive_timestamps_raise(tmp_path: Path) -> None:
+    path = tmp_path / "naive.csv"
+    _write_csv(
+        path,
+        [
+            _bar("2024-01-16T14:30:00"),
+            _bar("2024-01-16 14:31:00"),
+        ],
+    )
+    with pytest.raises(ValueError, match="naive"):
+        load_ohlcv(path)
+
+
+def test_non_utc_offset_raises(tmp_path: Path) -> None:
+    path = tmp_path / "offset.csv"
+    _write_csv(path, [_bar("2024-01-16T09:30:00-05:00")])
+    with pytest.raises(ValueError, match="must be UTC"):
+        load_ohlcv(path)
+
+
+def test_mixed_offsets_raise(tmp_path: Path) -> None:
+    path = tmp_path / "mixed.csv"
+    _write_csv(
+        path,
+        [
+            _bar("2024-01-16T14:30:00.000000000Z"),
+            _bar("2024-01-16T09:31:00-05:00"),
+        ],
+    )
+    with pytest.raises(ValueError, match="mixes timezone offsets"):
+        load_ohlcv(path)
+
+
+@pytest.mark.parametrize("stamp", ["1705415400000000000.0", "-1", "1e18"])
+def test_non_integer_digit_like_timestamps_raise(tmp_path: Path, stamp: str) -> None:
+    path = tmp_path / "digits.csv"
+    row = _bar(stamp)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=COLUMNS, quoting=csv.QUOTE_NONNUMERIC
+        )
+        writer.writeheader()
+        writer.writerow(row)
+    with pytest.raises(ValueError, match="digit-like"):
+        load_ohlcv(path)
+
+
+def test_integer_nanosecond_text_with_padding_is_utc(tmp_path: Path) -> None:
+    winter = pd.Timestamp("2024-01-16T14:30:00Z")
+    path = tmp_path / "text-ns.csv"
+    _write_csv(path, [_bar(f" {winter.value}")])
+    frame = load_ohlcv(path)
+    assert frame.index[0] == pd.Timestamp("2024-01-16 09:30", tz="America/New_York")
+
+
+def test_bad_iso8601_wraps_pandas_error(tmp_path: Path) -> None:
+    path = tmp_path / "bad-iso.csv"
+    _write_csv(path, [_bar("2024-13-01T00:00:00Z")])
+    with pytest.raises(ValueError, match="could not be parsed as UTC timestamps") as raised:
+        load_ohlcv(path)
+    assert raised.value.__cause__ is not None
+
+
+def test_float_timestamps_raise(tmp_path: Path) -> None:
+    path = tmp_path / "float.parquet"
+    frame = pd.DataFrame([_bar("ignored")])
+    frame["ts_event"] = pd.Series([1705415400000000000.0], dtype="float64")
+    frame.to_parquet(path, index=False)
+    with pytest.raises(ValueError, match="floats cannot represent nanoseconds"):
+        load_ohlcv(path)
+
+
+def test_naive_or_non_utc_datetime_dtype_raises(tmp_path: Path) -> None:
+    naive_path = tmp_path / "naive.parquet"
+    naive = pd.DataFrame([_bar("ignored")])
+    naive["ts_event"] = pd.to_datetime(["2024-01-16T14:30:00"])
+    naive.to_parquet(naive_path, index=False)
+    with pytest.raises(ValueError, match="naive"):
+        load_ohlcv(naive_path)
+
+    zoned_path = tmp_path / "zoned.parquet"
+    zoned = pd.DataFrame([_bar("ignored")])
+    zoned["ts_event"] = pd.to_datetime(["2024-01-16T09:30:00"]).tz_localize(
+        "America/New_York"
+    )
+    zoned.to_parquet(zoned_path, index=False)
+    with pytest.raises(ValueError, match="must be UTC"):
+        load_ohlcv(zoned_path)
+

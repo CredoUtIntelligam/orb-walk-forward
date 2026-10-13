@@ -9,7 +9,10 @@ description = "Sample-data loader for MES/ES opening-range breakout research."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "numpy>=2",
     "pandas>=2.0",
+    "pandas-market-calendars>=4.3",
+    "pyarrow>=14",
     "pytest>=7.0",
     "tzdata>=2024.1",
 ]

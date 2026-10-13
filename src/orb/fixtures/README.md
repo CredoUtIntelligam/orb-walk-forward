@@ -3,7 +3,8 @@
 `SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv` is fabricated. It exists so the loader
 and later opening-range code have a small Databento-shaped file. It is not a
 Databento download, not a recording of MES or ES, and not input for P&L,
-backtests, or any performance number.
+backtests, or any performance number. `load_ohlcv` raises on this file unless
+`allow_synthetic=True` is passed explicitly.
 
 ## Format
 

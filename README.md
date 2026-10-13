@@ -22,21 +22,31 @@ tests/test_loader.py
 pyproject.toml
 ```
 
-Python 3.10+. Runtime dependencies are pandas and tzdata. pytest is installed with the package so the test suite runs without the Databento SDK or an API key.
+Python 3.10+. Runtime dependencies are pandas, numpy, pandas-market-calendars, pyarrow, and tzdata. pytest is installed with the package so the test suite runs without the Databento SDK or an API key.
 
 ## Sample-data loader
 
-`load_ohlcv` reads a local Databento OHLCV-1m CSV (Parquet only if a local engine such as pyarrow is already installed). It does not download anything.
+`load_ohlcv` reads a local Databento OHLCV-1m CSV or Parquet file. It does not download anything.
 
-`ts_event` is UTC, either ISO-8601 text or integer nanoseconds. The frame is indexed by timezone-aware `America/New_York` timestamps, so daylight saving time follows the IANA timezone. OHLC columns are floats and `volume` is int. Pass `symbol` to keep one instrument. Pass `rth_only=True` to keep bars in `[09:30, 16:00)` ET. 16:00 is exclusive because these bars are stamped at the start of the minute; the last regular-hours bar starts at 15:59.
+`ts_event` must be UTC: ISO-8601 text with an explicit `Z` or `+00:00` offset, or integer nanoseconds. Naive timestamps, non-UTC offsets, mixed offsets, and non-integer digit-like strings are rejected. The frame is indexed by timezone-aware `America/New_York` timestamps, so daylight saving time follows the IANA timezone. OHLC columns are floats and `volume` is int. Bars with `high < low`, an open or close outside `[low, high]`, or a negative volume are rejected. A repeated symbol and timestamp raises unless `drop_duplicates=True`.
+
+Pass `symbol` to keep one instrument. Pass `rth_only=True` to keep CME equity regular trading hours: `[09:30, 16:00)` ET on a full session, using the `CME_Equity` calendar for weekends, holidays, and early closes. 16:00 is exclusive because these bars are stamped at the start of the minute; the last full-session bar starts at 15:59. An earlier exchange halt shortens that window. Missing minutes inside a session are reported (`rth_gap_before` and `rth_gap_report`) and are never filled.
+
+Early-close sessions are flagged on the `early_close` column and stay in the loaded frame. `signal_bars` always removes them. That exclusion is fixed; there is no switch to include early-close sessions in signals.
 
 ```python
-from orb import load_ohlcv, sample_fixture_path
+from orb import load_ohlcv, sample_fixture_path, signal_bars
 
-bars = load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=True)
+bars = load_ohlcv(
+    sample_fixture_path(),
+    symbol="MES",
+    rth_only=True,
+    allow_synthetic=True,
+)
+eligible = signal_bars(bars)
 ```
 
-`src/orb/fixtures/SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv` is synthetic test data: three fabricated MES regular-hours sessions shaped so a later opening-range check can see a long breakout, a short breakout, and a day with no breakout. It is not real market data. Do not compute performance from it. See `src/orb/fixtures/README.md`.
+`src/orb/fixtures/SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv` is synthetic test data: three fabricated MES regular-hours sessions shaped so a later opening-range check can see a long breakout, a short breakout, and a day with no breakout. It is not real market data. Do not compute performance from it. `load_ohlcv` raises unless `allow_synthetic=True`. See `src/orb/fixtures/README.md`.
 
 ## Tests
 

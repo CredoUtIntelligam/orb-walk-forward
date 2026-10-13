@@ -20,6 +20,8 @@ build/
 data/
 *.parquet
 *.csv
+# The synthetic OHLCV fixture is small, fake, and required by the tests.
+!src/orb/fixtures/*.csv
 !results/.gitkeep
 results/*.csv
 results/*.png

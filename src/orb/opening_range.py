@@ -1,7 +1,10 @@
 """Opening-range high and low for each regular-hours session.
 
 Bars are 1-minute OHLCV with a timezone-aware index, as returned by
-``load_ohlcv``. The window starts at the RTH open, 09:30 America/New_York.
+``load_ohlcv``. When the ranges will feed breakout signals, pass
+``signal_bars(load_ohlcv(...))`` so early-close sessions are already
+gone. This function does not drop ``early_close`` rows itself. The
+window starts at the RTH open, 09:30 America/New_York.
 Stamps are the start of the minute, so a window of W minutes is the
 half-open interval [09:30, 09:30 + W minutes). A 15-minute opening range
 uses the 15 bars from 09:30 through 09:44 inclusive.
@@ -52,7 +55,9 @@ def opening_ranges(
         window is applied. Naive timestamps are rejected rather than
         assumed to be Eastern. Columns ``open``, ``high``, ``low``,
         ``close``, and ``volume`` are required. When ``symbol`` is
-        present it must name a single instrument.
+        present it must name a single instrument. Pass
+        ``signal_bars`` output when these ranges will be used for
+        signals; early-close sessions are not removed here.
     window_minutes:
         Length of the opening range in minutes. The default is 15. The
         window is ``[09:30, 09:30 + window_minutes)`` ET and must end at

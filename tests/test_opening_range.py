@@ -100,7 +100,12 @@ def test_fixture_ranges_for_configurable_windows() -> None:
     a window that ran through 10:00 would not match these levels. Bar count
     follows the requested window, not the 390-bar regular session.
     """
-    bars = load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=True)
+    bars = load_ohlcv(
+        sample_fixture_path(),
+        symbol="MES",
+        rth_only=True,
+        allow_synthetic=True,
+    )
     assert str(bars.index.tz) == NY
 
     for minutes in (5, 15, 30):
@@ -127,7 +132,12 @@ def test_fixture_ranges_for_configurable_windows() -> None:
     pd.testing.assert_frame_equal(fifteen, opening_ranges(trimmed, window_minutes=15))
 
     # Non-RTH bars in the same file are outside the window.
-    full = load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=False)
+    full = load_ohlcv(
+        sample_fixture_path(),
+        symbol="MES",
+        rth_only=False,
+        allow_synthetic=True,
+    )
     pd.testing.assert_frame_equal(fifteen, opening_ranges(full, window_minutes=15))
 
     long_day = bars.loc["2024-01-16"]
@@ -385,7 +395,7 @@ def test_empty_frame_and_input_are_unchanged() -> None:
     assert result.empty
     assert list(result.columns) == RESULT_COLUMNS
 
-    bars = load_ohlcv(sample_fixture_path(), symbol="MES")
+    bars = load_ohlcv(sample_fixture_path(), symbol="MES", allow_synthetic=True)
     before = bars.copy()
     opening_ranges(bars, window_minutes=5)
     pd.testing.assert_frame_equal(bars, before)

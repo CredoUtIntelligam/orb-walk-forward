@@ -32,6 +32,14 @@ sides on one bar is a ``high_low`` case.
 
 ``entry_price`` is a reference on the signal. It is not a fill. This
 module does not size a position, choose a stop or target, or compute P&L.
+
+Early-close sessions are not signaled. Callers should pass
+``signal_bars(load_ohlcv(...))`` into both ``opening_ranges`` and
+``breakout_signals``, so the range table and the scan cover the same
+sessions. ``signal_bars`` always drops sessions flagged ``early_close``,
+including holiday short sessions, and has no parameter that puts them
+back. When ``bars`` still carries that column, this function applies the
+same drop before it scans.
 """
 
 from __future__ import annotations
@@ -43,7 +51,7 @@ from typing import Literal, TypedDict
 import numpy as np
 import pandas as pd
 
-from orb.loader import NY_TZ, RTH_CLOSE_MINUTES, RTH_OPEN_MINUTES
+from orb.loader import NY_TZ, RTH_CLOSE_MINUTES, RTH_OPEN_MINUTES, signal_bars
 
 DEFAULT_TRIGGER = "close"
 TRIGGER_CLOSE = "close"
@@ -115,6 +123,12 @@ def breakout_signals(
         ``high``, ``low``, ``close``, and ``volume`` are required. When
         ``symbol`` is present it must name a single instrument. Duplicate
         timestamps are rejected. The frame is not modified.
+
+        Pass the frame from ``signal_bars(load_ohlcv(...))``. If
+        ``early_close`` is still present, rows with that flag set are
+        dropped before the scan. There is no parameter that keeps them.
+        A frame without the column is scanned as given, which is how
+        hand-built bars that never came from the loader are accepted.
     ranges:
         Opening ranges from ``opening_ranges``. Required columns are
         ``session_date``, ``range_high``, ``range_low``, and
@@ -185,6 +199,10 @@ def _prepare_bars(bars: pd.DataFrame) -> pd.DataFrame:
 
     if frame.index.isna().any():
         raise ValueError("bars index contains missing timestamps")
+    # Same rule as ``signal_bars``: early-close sessions never signal.
+    # Frames built without the column are left unchanged.
+    if "early_close" in frame.columns:
+        frame = signal_bars(frame)
     _reject_multiple_symbols(frame)
     if frame.empty:
         return frame

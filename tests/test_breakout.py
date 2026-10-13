@@ -429,8 +429,7 @@ def test_empty_inputs_emit_nothing_and_frames_are_unchanged() -> None:
     pd.testing.assert_frame_equal(ranges, before_ranges)
 
     empty_ranges = pd.DataFrame(columns=list(ranges.columns))
-    with pytest.raises(TypeError, match="window_minutes"):
-        breakout_signals(bars, empty_ranges)
+    assert breakout_signals(bars, empty_ranges) == []
 
 
 def test_bad_bars_and_ranges_are_rejected() -> None:

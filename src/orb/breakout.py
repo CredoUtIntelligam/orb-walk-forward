@@ -225,6 +225,9 @@ def _prepare_ranges(ranges: pd.DataFrame) -> list[_RangeSession]:
     missing = [name for name in RANGE_COLUMNS if name not in ranges.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
+    # No rows means no signals. Dtype and bound checks apply to rows that exist.
+    if ranges.empty:
+        return []
 
     for name in ("range_high", "range_low"):
         column = ranges[name]
@@ -240,8 +243,6 @@ def _prepare_ranges(ranges: pd.DataFrame) -> list[_RangeSession]:
         raise TypeError("window_minutes must be an int number of minutes")
     if windows.isna().any():
         raise ValueError("window_minutes contains missing values")
-    if ranges.empty:
-        return []
 
     sessions: list[_RangeSession] = []
     seen: set[date] = set()

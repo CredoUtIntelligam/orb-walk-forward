@@ -7,8 +7,8 @@ package setuptools installs. Import the loader with `from orb import load_ohlcv`
 
 Current modules:
 
-- `orb/loader.py` — read a local Databento-style OHLCV-1m CSV into a
-  New York-indexed DataFrame
+- `orb/loader.py` — read a local Databento-style OHLCV-1m CSV or Parquet
+  file into a New York-indexed DataFrame (CME equity RTH, gap report)
 - `orb/fixtures/` — synthetic test CSV (not real market data)
 
 Opening-range calculation, breakout signals, and walk-forward code are not in

@@ -67,7 +67,7 @@ def test_fixture_columns_and_dtypes() -> None:
     path = sample_fixture_path()
     assert path.is_file()
     assert "SYNTHETIC_TEST_DATA" in path.name
-    readme = (path.parent / "README.md").read_text(encoding="utf-8")
+    readme = " ".join((path.parent / "README.md").read_text(encoding="utf-8").split())
     assert "SYNTHETIC TEST DATA" in readme
     assert "not a Databento download" in readme
 

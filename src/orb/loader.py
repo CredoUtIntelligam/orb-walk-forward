@@ -6,13 +6,17 @@ to America/New_York, so US daylight saving time follows the IANA rules.
 
 Regular trading hours are the equity cash window ``[09:30, 16:00)`` ET,
 intersected with the CME equity calendar (``CME_Equity``). Weekends and full
-holidays are not sessions. When the exchange halt is earlier than 16:00 ET
-the window ends at that halt, the session is flagged ``early_close``, and
-:func:`signal_bars` drops it. That exclusion is fixed.
+holidays are not sessions. Holiday short sessions, when futures still trade
+a shortened day (July 4, Thanksgiving, MLK Day, and any other CME equity halt
+before 16:00 ET), are early closes: the window ends at the halt, the session
+is flagged ``early_close``, and :func:`signal_bars` always drops it. Those
+sessions stay in the loaded frame and in the RTH gap report. That exclusion
+is fixed.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, time, timedelta
 from functools import lru_cache
@@ -42,7 +46,6 @@ OHLC_COLUMNS = ("open", "high", "low", "close")
 LEADING_COLUMNS = ("open", "high", "low", "close", "volume", "symbol")
 
 FIXTURE_NAME = "SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv"
-_SYNTHETIC_NAME_TOKEN = "SYNTHETIC_TEST_DATA"
 
 _INTEGER_NS = re.compile(r"\d+")
 _DIGIT_LIKE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
@@ -62,7 +65,8 @@ def sample_fixture_path() -> Path:
     """Return the bundled synthetic MES OHLCV-1m CSV.
 
     The file is fabricated test data, not a market recording.
-    :func:`load_ohlcv` refuses it unless ``allow_synthetic=True``.
+    :func:`load_ohlcv` refuses that content unless ``allow_synthetic=True``,
+    including copies under another name or a Parquet conversion.
     """
     return Path(__file__).resolve().parent / "fixtures" / FIXTURE_NAME
 
@@ -91,12 +95,16 @@ def load_ohlcv(
         whitespace. ``None`` keeps every symbol.
     rth_only:
         Keep bars inside CME equity regular trading hours. On a full session
-        that is ``[09:30, 16:00)`` America/New_York. Early-close sessions end
-        at the exchange halt. Holidays and weekends are not regular hours.
+        that is ``[09:30, 16:00)`` America/New_York. Early-close sessions,
+        including holiday short sessions such as July 4, Thanksgiving, and
+        MLK Day, end at the exchange halt. Weekends and full holidays are not
+        regular hours.
     allow_synthetic:
-        Must be ``True`` to load the bundled synthetic fixture (or any file
-        whose name contains ``SYNTHETIC_TEST_DATA``). The default refuses
-        those files so fabricated bars cannot enter a backtest unnoticed.
+        Must be ``True`` to load bars whose normalized content matches the
+        bundled synthetic fixture. The check is a checksum of those rows, not
+        the file name, so a renamed copy or a Parquet conversion still
+        raises. The default refuses that content so fabricated bars cannot
+        enter a backtest unnoticed.
     drop_duplicates:
         When ``False`` (the default), a repeated ``(symbol, ts_event)`` pair
         raises ``ValueError``. When ``True``, the first row of each pair is
@@ -109,22 +117,26 @@ def load_ohlcv(
         Index ``ts_event`` is timezone-aware in America/New_York.
         OHLC columns are ``float64`` and ``volume`` is ``int64``.
         ``early_close`` is ``True`` on sessions whose CME equity halt is
-        before 16:00 ET. ``rth_gap_before`` counts missing RTH minutes
-        immediately before that bar (zero when the previous RTH minute is
-        present). Missing minutes are not inserted. The full gap table is
-        ``attrs["rth_gaps"]`` and :func:`rth_gap_report`.
+        before 16:00 ET, including holiday short sessions (July 4,
+        Thanksgiving, MLK Day, and the like). ``rth_gap_before`` counts
+        missing RTH minutes immediately before that bar (zero when the
+        previous RTH minute is present). Missing minutes are not inserted.
+        The full gap table is ``attrs["rth_gaps"]`` and :func:`rth_gap_report`.
+        Early-close sessions, including those holiday short sessions, stay
+        eligible for that gap report.
 
         Early-close sessions stay in this frame so the flag is visible.
-        :func:`signal_bars` always removes them.
+        :func:`signal_bars` always removes them. There is no switch to put
+        them back.
     """
     path = Path(path)
-    if _is_synthetic_fixture(path) and not allow_synthetic:
-        raise ValueError(
-            f"Refusing to load synthetic fixture {path.name}; "
-            "pass allow_synthetic=True to load fabricated test data"
-        )
     frame = _read_table(path)
     frame = _normalize(frame)
+    if not allow_synthetic and _is_synthetic_content(frame):
+        raise ValueError(
+            "Refusing to load synthetic fixture content; "
+            "pass allow_synthetic=True to load fabricated test data"
+        )
     if symbol is not None:
         # Boolean NumPy masks keep rows even when timestamps are duplicated
         # across symbols. A Series mask would realign on that index and fail.
@@ -161,8 +173,10 @@ def rth_gap_report(bars: pd.DataFrame) -> pd.DataFrame:
 
     The table describes gaps inside CME equity RTH. It never fills them.
     ``start`` is inclusive and ``end`` is exclusive, both America/New_York.
-    ``session`` is the New York calendar date (``YYYY-MM-DD``). A load result
-    caches this table on ``attrs["rth_gaps"]``.
+    ``session`` is the New York calendar date (``YYYY-MM-DD``). Holiday short
+    sessions stay eligible: their missing minutes are measured to the early
+    halt, not dropped from this report. A load result caches this table on
+    ``attrs["rth_gaps"]``.
     """
     cached = bars.attrs.get("rth_gaps")
     if isinstance(cached, pd.DataFrame):
@@ -171,13 +185,47 @@ def rth_gap_report(bars: pd.DataFrame) -> pd.DataFrame:
     return _build_gap_report(bars, windows)
 
 
-def _is_synthetic_fixture(path: Path) -> bool:
-    if _SYNTHETIC_NAME_TOKEN in path.name:
-        return True
-    try:
-        return path.resolve() == sample_fixture_path().resolve()
-    except OSError:
-        return False
+def _is_synthetic_content(frame: pd.DataFrame) -> bool:
+    """True when normalized rows match the bundled fabricated fixture.
+
+    The comparison is a checksum of the timestamps and columns, so the file
+    name and the container (CSV or Parquet) do not matter.
+    """
+    return _frame_fingerprint(frame) == _bundled_synthetic_fingerprint()
+
+
+@lru_cache(maxsize=1)
+def _bundled_synthetic_fingerprint() -> str:
+    return _frame_fingerprint(_normalize(_read_table(sample_fixture_path())))
+
+
+def _frame_fingerprint(frame: pd.DataFrame) -> str:
+    ordered = frame.sort_index(kind="mergesort")
+    extras = sorted(
+        name
+        for name in ordered.columns
+        if name not in LEADING_COLUMNS and name not in {"early_close", "rth_gap_before"}
+    )
+    hasher = hashlib.sha256()
+    hasher.update(_utc_nanoseconds(ordered.index).tobytes())
+    for name in list(LEADING_COLUMNS) + extras:
+        hasher.update(name.encode())
+        values = ordered[name]
+        if name in OHLC_COLUMNS:
+            payload = np.asarray(values, dtype="float64").tobytes()
+        elif name == "volume":
+            payload = np.asarray(values, dtype="int64").tobytes()
+        else:
+            payload = "\n".join(str(value) for value in values.tolist()).encode()
+        hasher.update(payload)
+    return hasher.hexdigest()
+
+
+def _utc_nanoseconds(index: pd.DatetimeIndex) -> np.ndarray:
+    utc = index.tz_convert("UTC")
+    if hasattr(utc, "as_unit"):
+        utc = utc.as_unit("ns")
+    return np.ascontiguousarray(utc.asi8)
 
 
 def _read_table(path: Path) -> pd.DataFrame:
@@ -243,6 +291,12 @@ def _to_numeric(series: pd.Series, column: str) -> pd.Series:
 
 
 def _require_price_sanity(frame: pd.DataFrame) -> None:
+    for column in OHLC_COLUMNS:
+        values = frame[column]
+        if np.isinf(values.to_numpy()).any():
+            raise ValueError(f"{column} must be finite")
+        if (values <= 0).any():
+            raise ValueError(f"{column} must be positive")
     high = frame["high"]
     low = frame["low"]
     if (high < low).any():
@@ -428,7 +482,9 @@ def _session_rth(
 
     ``rth_close`` is exclusive. Dates with no RTH overlap are omitted from
     the window map. A date is early-close when CME equity halts before
-    16:00 ET, including halts at or before the 09:30 open.
+    16:00 ET. That includes holiday short sessions (July 4, Thanksgiving,
+    MLK Day, and similar days that still trade a shortened futures session)
+    and halts at or before the 09:30 open.
     """
     if len(index) == 0:
         return {}, set()

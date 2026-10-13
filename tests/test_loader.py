@@ -61,7 +61,7 @@ def _bar(
     symbol: str = "MES",
     open_: float = 100.0,
     high: float = 1000.0,
-    low: float = 0.0,
+    low: float = 1.0,
     close: float = 100.0,
     volume: int = 10,
 ) -> dict[str, object]:
@@ -293,6 +293,26 @@ def test_synthetic_fixture_requires_explicit_opt_in(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="allow_synthetic"):
         load_ohlcv(copied)
     assert not load_ohlcv(copied, allow_synthetic=True).empty
+
+
+def test_synthetic_content_guard_blocks_copy_rename_and_parquet(tmp_path: Path) -> None:
+    """Filename and container changes do not bypass the synthetic checksum."""
+    source = sample_fixture_path()
+    copied = tmp_path / "es_ohlcv.csv"
+    copied.write_bytes(source.read_bytes())
+    renamed = tmp_path / source.name.lower()
+    renamed.write_bytes(source.read_bytes())
+    table = pd.read_csv(source)
+    table["ts_event"] = pd.to_datetime(table["ts_event"], utc=True, format="ISO8601")
+    parquet = tmp_path / "mes_ohlcv.parquet"
+    table.to_parquet(parquet, index=False)
+
+    for path in (copied, renamed, parquet):
+        with pytest.raises(ValueError, match="allow_synthetic"):
+            load_ohlcv(path)
+        loaded = load_ohlcv(path, allow_synthetic=True)
+        assert len(loaded) == 1179
+        assert set(loaded["symbol"].unique()) == {"MES"}
 
 
 def test_duplicate_symbol_timestamp_raises_unless_dropped(tmp_path: Path) -> None:
@@ -679,4 +699,110 @@ def test_naive_or_non_utc_datetime_dtype_raises(tmp_path: Path) -> None:
     zoned.to_parquet(zoned_path, index=False)
     with pytest.raises(ValueError, match="must be UTC"):
         load_ohlcv(zoned_path)
+
+
+def test_non_numeric_price_raises(tmp_path: Path) -> None:
+    path = tmp_path / "text.csv"
+    row = _bar("2024-01-16T14:30:00.000000000Z", open_=100, high=110, low=90, close=105)
+    row["open"] = "abc"
+    _write_csv(path, [row])
+    with pytest.raises(ValueError, match="open contains non-numeric values") as raised:
+        load_ohlcv(path)
+    assert raised.value.__cause__ is not None
+
+
+def test_out_of_range_integer_nanoseconds_raise(tmp_path: Path) -> None:
+    path = tmp_path / "overflow.csv"
+    _write_csv(path, [_bar("9" * 40)])
+    with pytest.raises(ValueError, match="not valid nanosecond timestamps") as raised:
+        load_ohlcv(path)
+    assert raised.value.__cause__ is not None
+
+
+def test_integer_nanoseconds_mixed_with_timestamp_text_raise(tmp_path: Path) -> None:
+    winter = pd.Timestamp("2024-01-16T14:30:00Z")
+    path = tmp_path / "mixed-repr.csv"
+    _write_csv(
+        path,
+        [
+            _bar(str(winter.value)),
+            _bar("2024-01-16T14:31:00.000000000Z"),
+        ],
+    )
+    with pytest.raises(ValueError, match="mixes integer nanoseconds"):
+        load_ohlcv(path)
+
+
+def test_signal_bars_requires_early_close_column() -> None:
+    with pytest.raises(ValueError, match="early_close"):
+        signal_bars(pd.DataFrame({"close": [1.0]}))
+
+
+def test_parquet_ts_event_index_is_reset(tmp_path: Path) -> None:
+    frame = pd.DataFrame([_bar("2024-01-16T14:30:00.000000000Z", close=100)])
+    frame["ts_event"] = pd.to_datetime(frame["ts_event"], utc=True, format="ISO8601")
+    indexed = frame.set_index("ts_event")
+    path = tmp_path / "indexed.parquet"
+    indexed.to_parquet(path)
+    raw = pd.read_parquet(path)
+    assert "ts_event" not in raw.columns
+    assert raw.index.name == "ts_event"
+    loaded = load_ohlcv(path)
+    assert loaded.index.name == "ts_event"
+    assert loaded.index[0] == pd.Timestamp("2024-01-16 09:30", tz="America/New_York")
+    assert "ts_event" not in loaded.columns
+    assert float(loaded.iloc[0]["close"]) == 100.0
+
+
+def test_holiday_short_sessions_are_early_closes_and_keep_gap_reports(
+    tmp_path: Path,
+) -> None:
+    """July 4, Thanksgiving, and MLK trade a shortened futures session.
+
+    Those days are early closes: flagged, always excluded from signals, and
+    still present in the RTH gap report out to the early halt.
+    """
+    path = tmp_path / "short-holidays.csv"
+    days = ("2024-01-15", "2024-07-04", "2024-11-28")
+    rows = []
+    for day in days:
+        rows.append(_bar(_utc(f"{day} 09:30"), close=100))
+        rows.append(_bar(_utc(f"{day} 13:00"), close=100))
+    _write_csv(path, rows)
+
+    rth = load_ohlcv(path, rth_only=True)
+    assert signal_bars(rth).empty
+    gaps = rth_gap_report(rth)
+    for day in days:
+        session = _on(rth, day)
+        assert _clocks(session) == [(9, 30)]
+        assert bool(session["early_close"].all())
+        halt = pd.Timestamp(f"{day} 13:00", tz="America/New_York")
+        reported = gaps[gaps["session"] == day]
+        assert not reported.empty
+        assert reported["end"].max() == halt
+        assert not bool((reported["start"] >= halt).any())
+        assert _on(signal_bars(rth), day).empty
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low", "close"])
+@pytest.mark.parametrize("bad", ["inf", "-inf"])
+def test_infinite_prices_raise(tmp_path: Path, column: str, bad: str) -> None:
+    path = tmp_path / "inf.csv"
+    row = _bar("2024-01-16T14:30:00.000000000Z", open_=100, high=110, low=90, close=105)
+    row[column] = bad
+    _write_csv(path, [row])
+    with pytest.raises(ValueError, match=f"{column} must be finite"):
+        load_ohlcv(path)
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low", "close"])
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_non_positive_prices_raise(tmp_path: Path, column: str, bad: str) -> None:
+    path = tmp_path / "nonpositive.csv"
+    row = _bar("2024-01-16T14:30:00.000000000Z", open_=100, high=110, low=90, close=105)
+    row[column] = bad
+    _write_csv(path, [row])
+    with pytest.raises(ValueError, match=f"{column} must be positive"):
+        load_ohlcv(path)
 

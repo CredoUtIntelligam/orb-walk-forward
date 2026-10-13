@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "orb-walk-forward"
 version = "0.1.0"
-description = "Sample-data loader and opening-range calculation for MES/ES ORB research."
+description = "Sample-data loader, opening range, and breakout signals for MES/ES ORB research."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

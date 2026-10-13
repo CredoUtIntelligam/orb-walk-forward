@@ -1,9 +1,9 @@
 # SYNTHETIC TEST DATA
 
-`SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv` is fabricated. It exists so the loader
-and later opening-range code have a small Databento-shaped file. It is not a
-Databento download, not a recording of MES or ES, and not input for P&L,
-backtests, or any performance number.
+`SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv` is fabricated. It exists so the loader,
+opening-range, and breakout-signal code have a small Databento-shaped file.
+It is not a Databento download, not a recording of MES or ES, and not input
+for P&L, backtests, or any performance number.
 
 ## Format
 
@@ -32,6 +32,11 @@ the same high and low. The breakout, when there is one, is at 10:00 ET.
 | 2024-01-16 | long breakout | 5000 | 5008 | trades above 5008 and stays above 5000 |
 | 2024-01-17 | short breakout | 5050 | 5058 | trades below 5050 and stays below 5058 |
 | 2024-01-18 | no breakout | 5100 | 5110 | stays strictly inside the range |
+
+The default breakout rule (close strictly beyond the range) and the
+`high_low` rule (high or low strictly through the range) both see that
+10:00 ET bar as the signal on the first two sessions. The third session
+emits nothing. These rows are still not a backtest.
 
 Daylight-saving conversion is covered in `tests/test_loader.py` with explicit
 UTC timestamps on both sides of the March and November transitions. These

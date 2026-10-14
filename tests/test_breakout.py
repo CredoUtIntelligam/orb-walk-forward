@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import inspect
+import json
 from dataclasses import FrozenInstanceError, fields
 from datetime import date, time, timedelta
 
@@ -108,6 +109,8 @@ def _signal(
     *,
     or_high: float = 10.0,
     or_low: float = 6.0,
+    window_minutes: int = 15,
+    trigger: str = TRIGGER_CLOSE,
 ) -> Signal:
     return Signal(
         session_date=day,
@@ -116,6 +119,8 @@ def _signal(
         or_low=or_low,
         entry_ts=pd.Timestamp(f"{day.isoformat()} {clock}", tz=NY),
         entry_price=entry_price,
+        window_minutes=window_minutes,
+        trigger=trigger,
     )
 
 
@@ -128,6 +133,8 @@ def test_signal_fields_are_frozen_and_one_per_day() -> None:
         "or_low",
         "entry_ts",
         "entry_price",
+        "window_minutes",
+        "trigger",
     ]
     bars = pd.concat(
         [
@@ -166,6 +173,14 @@ def test_signal_fields_are_frozen_and_one_per_day() -> None:
     assert signal.or_low == 6.0
     assert signal.entry_ts == pd.Timestamp("2024-01-16 09:45", tz=NY)
     assert signal.entry_price == 12.0
+    assert signal.window_minutes == 15
+    assert signal.trigger == TRIGGER_CLOSE
+    payload = signal.to_dict()
+    assert json.loads(json.dumps(payload)) == payload
+    assert payload["session_date"] == "2024-01-16"
+    assert payload["entry_ts"] == "2024-01-16T09:45:00-05:00"
+    assert payload["window_minutes"] == 15
+    assert payload["trigger"] == "close"
     with pytest.raises(FrozenInstanceError):
         signal.entry_price = 0.0  # type: ignore[misc]
 
@@ -194,7 +209,9 @@ def test_long_breakout_uses_the_first_close_above_the_high() -> None:
     assert signals[0].entry_ts.time() == time(9, 46)
 
     pierced = breakout_signals(bars, ranges, trigger=TRIGGER_HIGH_LOW)
-    assert pierced == [_signal(date(2024, 1, 16), LONG, "09:45", 10.0)]
+    assert pierced == [
+        _signal(date(2024, 1, 16), LONG, "09:45", 10.0, trigger=TRIGGER_HIGH_LOW)
+    ]
     assert float(bars.iloc[0]["high"]) == 13.0
 
 
@@ -315,7 +332,7 @@ def test_bars_inside_the_range_window_do_not_signal() -> None:
     assert breakout_signals(bars, fifteen) == []
     assert breakout_signals(bars, fifteen, trigger="high_low") == []
     assert breakout_signals(bars, fourteen) == [
-        _signal(date(2024, 1, 16), LONG, "09:44", 12.0)
+        _signal(date(2024, 1, 16), LONG, "09:44", 12.0, window_minutes=14)
     ]
 
 
@@ -354,7 +371,7 @@ def test_high_low_skips_a_bar_that_breaks_both_sides() -> None:
         ]
     )
     assert breakout_signals(followed, ranges, trigger="high_low") == [
-        _signal(date(2024, 1, 16), SHORT, "09:46", 6.0)
+        _signal(date(2024, 1, 16), SHORT, "09:46", 6.0, trigger=TRIGGER_HIGH_LOW)
     ]
 
 
@@ -454,6 +471,8 @@ def test_fixture_emits_long_short_and_no_breakout() -> None:
             or_low=spec["or_low"],
             entry_ts=pd.Timestamp(f"{day.isoformat()} 10:00", tz=NY),
             entry_price=spec["entry_price"],
+            window_minutes=15,
+            trigger=TRIGGER_CLOSE,
         )
         for day, spec in FIXTURE_SIGNALS.items()
     ]
@@ -470,6 +489,7 @@ def test_fixture_emits_long_short_and_no_breakout() -> None:
         signal.entry_ts for signal in signals
     ]
     assert [signal.direction for signal in touched] == [LONG, SHORT]
+    assert [signal.trigger for signal in touched] == [TRIGGER_HIGH_LOW, TRIGGER_HIGH_LOW]
     assert [signal.entry_price for signal in touched] == [
         spec["level_price"] for spec in FIXTURE_SIGNALS.values()
     ]
@@ -632,6 +652,43 @@ def test_recommended_path_emits_no_signal_on_early_close_sessions(tmp_path) -> N
     assert [signal.session_date for signal in breakout_signals(loaded, raw_ranges)] == [
         date(2024, 7, 5)
     ]
+
+
+def test_signal_rejects_bad_direction_and_field_types() -> None:
+    """Direction is only long or short, and each field has to match its type."""
+    good = _signal(date(2024, 1, 16), LONG, "09:45", 11.0)
+    assert good.to_dict()["direction"] == "long"
+
+    with pytest.raises(ValueError, match="direction"):
+        _signal(date(2024, 1, 16), "buy", "09:45", 11.0)
+    with pytest.raises(TypeError, match="session_date"):
+        Signal(
+            session_date=pd.Timestamp("2024-01-16 09:45", tz=NY),  # type: ignore[arg-type]
+            direction=LONG,
+            or_high=10.0,
+            or_low=6.0,
+            entry_ts=pd.Timestamp("2024-01-16 09:45", tz=NY),
+            entry_price=11.0,
+            window_minutes=15,
+            trigger=TRIGGER_CLOSE,
+        )
+    with pytest.raises(TypeError, match="entry_price"):
+        _signal(date(2024, 1, 16), LONG, "09:45", True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="naive"):
+        Signal(
+            session_date=date(2024, 1, 16),
+            direction=SHORT,
+            or_high=10.0,
+            or_low=6.0,
+            entry_ts=pd.Timestamp("2024-01-16 09:45"),
+            entry_price=11.0,
+            window_minutes=15,
+            trigger=TRIGGER_CLOSE,
+        )
+    with pytest.raises(TypeError, match="window_minutes"):
+        _signal(date(2024, 1, 16), LONG, "09:45", 11.0, window_minutes=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="close_5m"):
+        _signal(date(2024, 1, 16), LONG, "09:45", 11.0, trigger="wick")
 
 
 def _breakout_day(day: str) -> pd.DataFrame:

@@ -1,10 +1,23 @@
 """Command-line entry for opening-range breakout signals.
 
 ``python -m orb`` and the ``orb-signals`` console script load a local
-OHLCV-1m file, drop early-close sessions, and print the first breakout
-of each remaining session. The default file is the bundled synthetic
-fixture, which ``load_ohlcv`` refuses unless ``--allow-synthetic`` is
-passed through as ``allow_synthetic=True``.
+OHLCV-1m file, drop early-close sessions, and print signals.
+
+The default mode is a research scan and is NOT the frozen ES ORB spec.
+It uses a complete opening range (default 15 minutes) and the first
+1-minute break, long or short, through 16:00 ET. The default trigger is
+close-only: a 1-minute close strictly beyond the range. ``--trigger
+high_low`` is opt-in.
+
+``--preset frozen-es`` selects the spec signal: 30-minute box
+``[09:30, 10:00)``, partial when minutes are missing, first clock-aligned
+5-minute close strictly above the box high, long only, no entry after the
+13:50-13:55 bucket. ``entry_ts`` is the bucket close minute (10:04 for
+the 10:00 bucket).
+
+The default file is the bundled synthetic fixture, which ``load_ohlcv``
+refuses unless ``--allow-synthetic`` is passed through as
+``allow_synthetic=True``.
 
 This command does not size a position, choose an exit, or compute P&L.
 """
@@ -18,11 +31,10 @@ import json
 import sys
 from pathlib import Path
 
-import pandas as pd
-
-from orb.breakout import Signal, breakout_signals
+from orb.breakout import DEFAULT_TRIGGER, Signal, breakout_signals
 from orb.loader import load_ohlcv, sample_fixture_path, signal_bars
 from orb.opening_range import DEFAULT_WINDOW_MINUTES, opening_ranges
+from orb.preset import FROZEN_ES_PRESET, frozen_es_signals
 
 COLUMNS = (
     "session_date",
@@ -31,9 +43,12 @@ COLUMNS = (
     "or_low",
     "entry_ts",
     "entry_price",
+    "window_minutes",
+    "trigger",
 )
 
 _FORMATS = ("table", "json")
+_RESEARCH_TRIGGERS = ("close", "high_low")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,7 +63,10 @@ def main(argv: list[str] | None = None) -> int:
         signals = _signals(
             path,
             allow_synthetic=args.allow_synthetic,
+            symbol=args.symbol,
             window_minutes=args.window,
+            trigger=args.trigger,
+            preset=args.preset,
         )
     except FileNotFoundError as exc:
         return _fail(f"data file not found: {_location(exc, path)}")
@@ -69,9 +87,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="orb-signals",
         description=(
-            "Load OHLCV-1m bars and print the first opening-range breakout "
-            "of each session. Early-close sessions are always excluded. "
-            "This command does not size positions or compute P&L."
+            "Load OHLCV-1m bars and print opening-range breakout signals. "
+            "Early-close sessions are always excluded. "
+            "This command does not size positions, choose exits, or compute P&L. "
+            "The default mode is a research scan and is NOT the frozen ES ORB spec: "
+            "a complete opening range (default 15 minutes) and the first 1-minute "
+            "break, long or short. The default trigger is close-only. "
+            "--preset frozen-es is the spec signal."
         ),
     )
     parser.add_argument(
@@ -85,6 +107,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--symbol",
+        default=None,
+        help=(
+            "Keep one symbol, passed to load_ohlcv. "
+            "Use this to select a contract from a multi-contract file."
+        ),
+    )
+    parser.add_argument(
         "--allow-synthetic",
         action="store_true",
         help=(
@@ -93,13 +123,40 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--preset",
+        choices=(FROZEN_ES_PRESET,),
+        default=None,
+        help=(
+            "frozen-es: the frozen ES ORB signal (NOT the research default). "
+            "30-minute box [09:30, 10:00), partial when a later minute is "
+            "missing, skip a day only when the 09:30 bar is absent or the "
+            "box is empty, first clock-aligned 5-minute close strictly above "
+            "the box high, long only, buckets 10:00 through 13:50, entry_ts "
+            "at the bucket close minute (10:04 for the 10:00 bucket). "
+            "Replaces --window and --trigger."
+        ),
+    )
+    parser.add_argument(
         "--window",
         type=int,
-        default=DEFAULT_WINDOW_MINUTES,
+        default=None,
         help=(
-            "Opening-range length in minutes, passed to opening_ranges "
-            f"(default: {DEFAULT_WINDOW_MINUTES}). "
-            "The window is [09:30, 09:30 + window) America/New_York."
+            "Research mode only (NOT the frozen spec). Opening-range length "
+            f"in minutes (default: {DEFAULT_WINDOW_MINUTES} when --preset "
+            "is omitted). The window is [09:30, 09:30 + window) "
+            "America/New_York and must be complete."
+        ),
+    )
+    parser.add_argument(
+        "--trigger",
+        choices=_RESEARCH_TRIGGERS,
+        default=None,
+        help=(
+            "Research mode only (NOT the frozen spec). "
+            "close (the default, close-only): the first 1-minute close "
+            "strictly beyond the range, long or short. "
+            "high_low: the first 1-minute high or low that trades strictly "
+            "through the level. The default is close-only; high_low is opt-in."
         ),
     )
     parser.add_argument(
@@ -120,20 +177,47 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _signals(path: Path, *, allow_synthetic: bool, window_minutes: int) -> list[Signal]:
-    """Load bars and return the first breakout of each eligible session.
+def _signals(
+    path: Path,
+    *,
+    allow_synthetic: bool,
+    symbol: str | None,
+    window_minutes: int | None,
+    trigger: str | None,
+    preset: str | None,
+) -> list[Signal]:
+    """Load bars and return one breakout per eligible session.
 
     ``signal_bars`` drops early-close sessions and has no switch that puts
-    them back. The same frame feeds ``opening_ranges`` and
-    ``breakout_signals``.
+    them back. The research path then calls ``opening_ranges`` and
+    ``breakout_signals``. ``--preset frozen-es`` calls ``frozen_es_signals``
+    instead.
     """
-    bars = signal_bars(load_ohlcv(path, allow_synthetic=allow_synthetic))
-    ranges = opening_ranges(bars, window_minutes=window_minutes)
-    return breakout_signals(bars, ranges)
+    if preset == FROZEN_ES_PRESET:
+        if window_minutes is not None:
+            raise ValueError(
+                "--window does not apply with --preset frozen-es; "
+                "the spec opening range is 30 minutes [09:30, 10:00)"
+            )
+        if trigger is not None:
+            raise ValueError(
+                "--trigger does not apply with --preset frozen-es; "
+                "the spec trigger is the first clock-aligned 5-minute close "
+                "strictly above the opening-range high"
+            )
+    bars = signal_bars(
+        load_ohlcv(path, symbol=symbol, allow_synthetic=allow_synthetic)
+    )
+    if preset == FROZEN_ES_PRESET:
+        return frozen_es_signals(bars)
+    window = DEFAULT_WINDOW_MINUTES if window_minutes is None else window_minutes
+    rule = DEFAULT_TRIGGER if trigger is None else trigger
+    ranges = opening_ranges(bars, window_minutes=window)
+    return breakout_signals(bars, ranges, trigger=rule)
 
 
 def _emit(signals: list[Signal], *, fmt: str, out: Path | None) -> None:
-    records = [_record(signal) for signal in signals]
+    records = [signal.to_dict() for signal in signals]
     if out is not None:
         _write(out, records)
         return
@@ -152,17 +236,6 @@ def _write(path: Path, records: list[dict[str, object]]) -> None:
     else:
         raise ValueError(f"output path must end in .csv or .json; got {path.name!r}")
     path.write_text(text, encoding="utf-8")
-
-
-def _record(signal: Signal) -> dict[str, object]:
-    return {
-        "session_date": signal.session_date.isoformat(),
-        "direction": signal.direction,
-        "or_high": float(signal.or_high),
-        "or_low": float(signal.or_low),
-        "entry_ts": pd.Timestamp(signal.entry_ts).isoformat(),
-        "entry_price": float(signal.entry_price),
-    }
 
 
 def _json_text(records: list[dict[str, object]]) -> str:

@@ -1,5 +1,10 @@
 """First opening-range breakout of each regular-hours session.
 
+This research scan is not the frozen ES ORB spec. The spec signal is
+``frozen_es_signals`` (CLI ``--preset frozen-es``): a 30-minute box and
+the first clock-aligned 5-minute close strictly above that high, long
+only. ``breakout_signals`` is the separate research rule below.
+
 ``breakout_signals`` reads 1-minute bars and the per-session ranges from
 ``opening_ranges``. A session emits at most one signal: the first eligible
 bar that breaks the range. Later bars that day are ignored, including a
@@ -56,11 +61,17 @@ from orb.loader import NY_TZ, RTH_CLOSE_MINUTES, RTH_OPEN_MINUTES, signal_bars
 DEFAULT_TRIGGER = "close"
 TRIGGER_CLOSE = "close"
 TRIGGER_HIGH_LOW = "high_low"
+# Frozen ES spec: first clock-aligned 5-minute close strictly above the box.
+TRIGGER_CLOSE_5M = "close_5m"
 LONG = "long"
 SHORT = "short"
 
 MAX_WINDOW_MINUTES = RTH_CLOSE_MINUTES - RTH_OPEN_MINUTES
+# Research scan only. ``close_5m`` is recorded by the frozen preset, not
+# accepted by ``breakout_signals``.
 TRIGGERS = (TRIGGER_CLOSE, TRIGGER_HIGH_LOW)
+SIGNAL_TRIGGERS = (TRIGGER_CLOSE, TRIGGER_HIGH_LOW, TRIGGER_CLOSE_5M)
+DIRECTIONS = (LONG, SHORT)
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 RANGE_COLUMNS = ("session_date", "range_high", "range_low", "window_minutes")
@@ -68,9 +79,12 @@ PRICE_COLUMNS = ("high", "low", "close")
 
 __all__ = [
     "DEFAULT_TRIGGER",
+    "DIRECTIONS",
     "LONG",
     "SHORT",
+    "SIGNAL_TRIGGERS",
     "TRIGGER_CLOSE",
+    "TRIGGER_CLOSE_5M",
     "TRIGGER_HIGH_LOW",
     "Signal",
     "breakout_signals",
@@ -83,11 +97,18 @@ class Signal:
 
     ``session_date`` is the New York trading date. ``direction`` is
     ``"long"`` or ``"short"``. ``or_high`` and ``or_low`` are the
-    opening-range levels the signal was based on. ``entry_ts`` is the
-    start of the triggering 1-minute bar, timezone-aware in
-    America/New_York. ``entry_price`` is the reference for the trigger
-    that fired: the bar close for ``"close"``, and the broken level
-    (``or_high`` or ``or_low``) for ``"high_low"``.
+    opening-range levels the signal was based on. ``entry_ts`` is
+    timezone-aware in America/New_York. In the research scan it is the
+    start of the triggering 1-minute bar. Under the frozen ES preset it
+    is that bucket's close minute (the 10:00 bucket is stamped 10:04).
+    ``entry_price`` is the reference for the trigger that fired: the bar
+    close for ``"close"`` and for ``"close_5m"``, and the broken level
+    (``or_high`` or ``or_low``) for ``"high_low"``. ``window_minutes`` is
+    the opening-range length that produced the levels. ``trigger`` is
+    ``"close"``, ``"high_low"``, or ``"close_5m"``.
+
+    ``__post_init__`` checks those types and the direction. ``to_dict``
+    returns JSON-safe values. The record stays frozen.
     """
 
     session_date: date
@@ -96,6 +117,43 @@ class Signal:
     or_low: float
     entry_ts: pd.Timestamp
     entry_price: float
+    window_minutes: int
+    trigger: str
+
+    def __post_init__(self) -> None:
+        session_date = _require_session_date(self.session_date)
+        direction = _require_direction(self.direction)
+        or_high = _require_price(self.or_high, "or_high")
+        or_low = _require_price(self.or_low, "or_low")
+        entry_ts = _require_entry_ts(self.entry_ts)
+        entry_price = _require_price(self.entry_price, "entry_price")
+        window_minutes = _require_window_minutes(self.window_minutes)
+        trigger = _require_signal_trigger(self.trigger)
+        object.__setattr__(self, "session_date", session_date)
+        object.__setattr__(self, "direction", direction)
+        object.__setattr__(self, "or_high", or_high)
+        object.__setattr__(self, "or_low", or_low)
+        object.__setattr__(self, "entry_ts", entry_ts)
+        object.__setattr__(self, "entry_price", entry_price)
+        object.__setattr__(self, "window_minutes", window_minutes)
+        object.__setattr__(self, "trigger", trigger)
+
+    def to_dict(self) -> dict[str, object]:
+        """Return JSON-safe fields.
+
+        Dates and timestamps are ISO-8601 strings. Prices are ``float``
+        and ``window_minutes`` is ``int``.
+        """
+        return {
+            "session_date": self.session_date.isoformat(),
+            "direction": self.direction,
+            "or_high": self.or_high,
+            "or_low": self.or_low,
+            "entry_ts": self.entry_ts.isoformat(),
+            "entry_price": self.entry_price,
+            "window_minutes": self.window_minutes,
+            "trigger": self.trigger,
+        }
 
 
 class _RangeSession(TypedDict):
@@ -353,6 +411,8 @@ def _signal_for_day(
             or_low=range_low,
             entry_ts=pd.Timestamp(timestamp),
             entry_price=float(entry_price),
+            window_minutes=session["window_minutes"],
+            trigger=trigger,
         )
     return None
 
@@ -379,6 +439,64 @@ def _bar_break(
     bar_high = float(row["high"])
     bar_low = float(row["low"])
     return bar_high > range_high, bar_low < range_low, range_high, range_low
+
+
+def _require_session_date(value: object) -> date:
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise TypeError("session_date must be a datetime.date")
+    return value
+
+
+def _require_direction(value: object) -> str:
+    if not isinstance(value, str) or value not in DIRECTIONS:
+        raise ValueError("direction must be 'long' or 'short'")
+    return value
+
+
+def _require_price(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(f"{name} must be a float")
+    price = float(value)
+    if not np.isfinite(price):
+        raise ValueError(f"{name} must be finite")
+    return price
+
+
+def _require_entry_ts(value: object) -> pd.Timestamp:
+    if isinstance(value, pd.Timestamp):
+        stamp = value
+    elif isinstance(value, datetime):
+        stamp = pd.Timestamp(value)
+    else:
+        raise TypeError("entry_ts must be a timezone-aware pandas Timestamp")
+    if pd.isna(stamp):
+        raise ValueError("entry_ts is missing")
+    if stamp.tzinfo is None:
+        raise ValueError(
+            "entry_ts must be timezone-aware America/New_York; "
+            "naive timestamps are not treated as ET"
+        )
+    return pd.Timestamp(stamp).tz_convert(NY_TZ)
+
+
+def _require_window_minutes(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError("window_minutes must be an int number of minutes")
+    minutes = int(value)
+    if minutes < 1 or minutes > MAX_WINDOW_MINUTES:
+        raise ValueError(
+            "window_minutes must be a positive number of minutes "
+            f"no greater than {MAX_WINDOW_MINUTES}"
+        )
+    return minutes
+
+
+def _require_signal_trigger(value: object) -> str:
+    if not isinstance(value, str) or value not in SIGNAL_TRIGGERS:
+        raise ValueError("trigger must be 'close', 'high_low', or 'close_5m'")
+    return value
 
 
 def _as_date(value: object) -> date:

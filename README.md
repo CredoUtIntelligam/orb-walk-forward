@@ -7,7 +7,7 @@ This repo is designed to be driven by looping Grok Bots (orchestrator + speciali
 ## Goal
 Build a robust, reproducible walk-forward framework for ORB variants (range length, entry confirmation, filters, targets/stops, etc.) using Databento data where available. Results should support the existing Vega bot's ORB research.
 
-The code in this repo is landing one piece at a time. Piece 1 is the hardened sample-data loader. Piece 2 is the opening-range calculation. Piece 3 is the breakout signal. Piece 4 is a small CLI (`python -m orb` and `orb-signals`) that runs `signal_bars(load_ohlcv(...))` into the range and signal functions so early-close sessions never produce a signal. A walk-forward optimizer, position sizing, execution, and P&L stay out of scope.
+The code in this repo is landing one piece at a time. Piece 1 is the hardened sample-data loader. Piece 2 is the opening-range calculation. Piece 3 is the breakout signal. Piece 4 is a small CLI (`python -m orb` and `orb-signals`). The default CLI mode is a research scan and is not the frozen ES ORB spec. `--preset frozen-es` is that spec's signal rule. Early-close sessions never produce a signal. A walk-forward optimizer, position sizing, execution, and P&L stay out of scope.
 
 ## Package layout
 
@@ -20,12 +20,14 @@ src/orb/cli.py
 src/orb/loader.py
 src/orb/opening_range.py
 src/orb/breakout.py
+src/orb/preset.py
 src/orb/fixtures/SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv
 src/orb/fixtures/README.md
 tests/test_loader.py
 tests/test_opening_range.py
 tests/test_breakout.py
 tests/test_cli.py
+tests/test_preset.py
 pyproject.toml
 ```
 
@@ -75,11 +77,11 @@ Build ranges from `signal_bars(load_ohlcv(...))` when they will feed breakout si
 
 ## Breakout signals
 
-`breakout_signals` takes those bars and that range table and returns a `list[Signal]`. Each `Signal` has `session_date`, `direction` (`"long"` or `"short"`), `or_high`, `or_low`, `entry_ts` (start of the triggering minute, America/New_York), and `entry_price`. At most one signal is returned per session date.
+`breakout_signals` takes those bars and that range table and returns a `list[Signal]`. Each `Signal` has `session_date`, `direction` (`"long"` or `"short"`), `or_high`, `or_low`, `entry_ts` (start of the triggering minute, America/New_York), `entry_price`, `window_minutes`, and `trigger` (`"close"` or `"high_low"`). `to_dict()` returns those fields with dates and timestamps as ISO-8601 strings. The record is frozen, and `__post_init__` checks the direction and the field types. At most one signal is returned per session date. This research function is not the frozen ES ORB spec.
 
 A session emits at most one signal: the first eligible bar that breaks the range. Later bars that day are ignored, including a break of the other side. A session with no break is omitted. Eligible bars are minute-aligned stamps in `[09:30 + window_minutes, 16:00)` ET. Bars inside the opening-range window, and bars at or after 16:00, do not signal. `window_minutes` comes from each range row.
 
-The default trigger is `"close"`. Long means the bar closes strictly above the opening-range high. Short means it closes strictly below the opening-range low. A wick through the level with the close back inside the range is not a breakout. `entry_price` is that close.
+The default trigger is close-only: `"close"`. Long means the bar closes strictly above the opening-range high. Short means it closes strictly below the opening-range low. A wick through the level with the close back inside the range is not a breakout. `entry_price` is that close. `high_low` is opt-in.
 
 `trigger="high_low"` fires when the bar's high trades strictly above the opening-range high, or its low trades strictly below the opening-range low. `entry_price` is the broken level (`or_high` or `or_low`), not the wick. A bar that trades through both levels is skipped, and scanning continues. Tagging a level exactly is not a break under either rule.
 
@@ -89,18 +91,32 @@ Early-close sessions are excluded from signals. The recommended path is `load_oh
 
 ## CLI
 
-`python -m orb` and the `orb-signals` console script (from `[project.scripts]`, available after install) run that path and print the `list[Signal]`.
+`python -m orb` and the `orb-signals` console script (from `[project.scripts]`, available after install) print the `list[Signal]`.
 
-The default input is the bundled synthetic fixture. `load_ohlcv` refuses that content unless `--allow-synthetic` is set, which is passed through as `allow_synthetic=True`. `--data` selects another local CSV or Parquet file. A renamed copy of the fixture is still refused without the flag, because the check is the loader's content checksum, not the file name.
+The default mode is the research scan above. It is **not** the frozen ES ORB spec. `--window` is the opening-range length in minutes (default 15) and the session must contain every minute. `--trigger` is `close` or `high_low`. The default is close-only (`close`): the first 1-minute close strictly beyond the range. `high_low` is opt-in.
 
-`--window` is the opening-range length in minutes (default 15). Early-close sessions stay excluded; the CLI always calls `signal_bars` and has no flag that puts them back. Stdout is a readable table or JSON (`--format table` or `--format json`). `--out` writes a file instead of stdout, CSV or JSON by the extension.
+`--preset frozen-es` is the spec signal, via `frozen_es_signals`. The box is `[09:30, 10:00)` America/New_York. A missing minute after 09:30 still produces a partial range (max high, min low of the bars present). A day is skipped only when the 09:30 bar is absent or the box is empty. The trigger is the first clock-aligned 5-minute close strictly above the box high, long only. Buckets run 10:00, 10:05, ..., 13:50. Each bucket is `[t, t+5)` and the close is the 1-minute bar at `t+4`, so the 10:00 bucket is stamped 10:04. The 13:55 bucket is not eligible. `--window` and `--trigger` do not apply under the preset. The preset does not place a stop, choose a target, or compute P&L.
 
-Loader failures, including a missing path and a refused synthetic file, print a one-line error and exit nonzero. The command does not size a position, choose an exit, or compute P&L.
+`--symbol` keeps one symbol, which is how a multi-contract Databento file is narrowed to one outright. The default input is the bundled synthetic fixture. `load_ohlcv` refuses that content unless `--allow-synthetic` is set, which is passed through as `allow_synthetic=True`. `--data` selects another local CSV or Parquet file. A renamed copy of the fixture is still refused without the flag, because the check is the loader's content checksum, not the file name.
+
+Early-close sessions stay excluded; the CLI always calls `signal_bars` and has no flag that puts them back. Stdout is a readable table or JSON (`--format table` or `--format json`). `--out` writes a file instead of stdout, CSV or JSON by the extension.
+
+Loader failures, including a missing path and a refused synthetic file, print a one-line error and exit nonzero.
 
 ```bash
 python -m orb --allow-synthetic
-python -m orb --allow-synthetic --format json
-orb-signals --data path/to/ohlcv.csv --window 15 --out signals.csv
+python -m orb --allow-synthetic --preset frozen-es --format json
+orb-signals --data path/to/es.csv --symbol ESH6 --preset frozen-es --out signals.csv
+orb-signals --data path/to/ohlcv.csv --window 15 --trigger close --out signals.csv
+```
+
+```python
+from orb import frozen_es_signals, load_ohlcv, sample_fixture_path, signal_bars
+
+bars = signal_bars(
+    load_ohlcv(sample_fixture_path(), allow_synthetic=True, symbol="MES")
+)
+signals = frozen_es_signals(bars)
 ```
 
 ## Tests
@@ -111,7 +127,7 @@ pytest
 ```
 
 ## Structure
-- `src/orb/` — Installable package. Sample-data loader, opening-range calculation, breakout signals, a small CLI, and synthetic fixture.
+- `src/orb/` — Installable package. Sample-data loader, opening-range calculation, breakout signals, the frozen ES signal preset, a small CLI, and synthetic fixture.
 - `notebooks/` — Exploratory analysis and result visualization.
 - `results/` — Walk-forward outputs (CSV, plots, summaries). Gitignored large files.
 - `templates/` — Bot descriptions, prompt examples, and orchestration notes.

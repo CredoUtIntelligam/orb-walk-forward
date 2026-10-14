@@ -31,6 +31,8 @@ EXPECTED = [
         "or_low": 5000.0,
         "entry_ts": "2024-01-16T10:00:00-05:00",
         "entry_price": 5011.0,
+        "window_minutes": 15,
+        "trigger": "close",
     },
     {
         "session_date": "2024-01-17",
@@ -39,6 +41,8 @@ EXPECTED = [
         "or_low": 5050.0,
         "entry_ts": "2024-01-17T10:00:00-05:00",
         "entry_price": 5047.0,
+        "window_minutes": 15,
+        "trigger": "close",
     },
 ]
 
@@ -130,6 +134,8 @@ def test_window_selects_the_opening_range(
             "or_low": 6.0,
             "entry_ts": "2024-01-16T09:45:00-05:00",
             "entry_price": 11.0,
+            "window_minutes": 15,
+            "trigger": "close",
         }
     ]
 
@@ -204,6 +210,101 @@ def test_early_close_sessions_are_excluded(
     assert exc.value.code != 0
 
 
+def test_frozen_es_preset_on_the_fixture_is_one_long_at_1004(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--preset frozen-es`` is the spec signal, not the research default.
+
+    The fixture yields one long: 2024-01-16, entry 5011.0 at 10:04 ET.
+    ``--window`` and ``--trigger`` do not override that rule.
+    """
+    assert main(["--allow-synthetic", "--preset", "frozen-es", "--format", "json"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == [
+        {
+            "session_date": "2024-01-16",
+            "direction": "long",
+            "or_high": 5008.0,
+            "or_low": 5000.0,
+            "entry_ts": "2024-01-16T10:04:00-05:00",
+            "entry_price": 5011.0,
+            "window_minutes": 30,
+            "trigger": "close_5m",
+        }
+    ]
+
+    assert main(["--allow-synthetic", "--preset", "frozen-es", "--window", "15"]) == 1
+    refused = capsys.readouterr()
+    assert refused.out == ""
+    assert "--window" in refused.err
+    assert "Traceback" not in refused.err
+
+
+def test_help_labels_the_research_default_as_not_the_spec(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Help text says the default scan is not the frozen spec and is close-only."""
+    with pytest.raises(SystemExit) as caught:
+        main(["--help"])
+    assert caught.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "NOT the frozen ES ORB spec" in text
+    assert "close-only" in text
+    assert "frozen-es" in text
+    assert "--trigger" in text
+
+
+def test_symbol_filters_a_multi_contract_file(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """``--symbol`` keeps one contract from a file that holds two."""
+    path = tmp_path / "es-quarters.csv"
+    _write_two_contracts(path)
+    assert main(["--data", str(path), "--preset", "frozen-es"]) == 1
+    mixed = capsys.readouterr()
+    assert mixed.out == ""
+    assert "multiple symbols" in mixed.err
+
+    assert main(
+        ["--data", str(path), "--preset", "frozen-es", "--symbol", "ESH6", "--format", "json"]
+    ) == 0
+    esh = json.loads(capsys.readouterr().out)
+    assert len(esh) == 1
+    assert esh[0]["entry_price"] == 5011.0
+    assert esh[0]["or_high"] == 5008.0
+    assert esh[0]["direction"] == "long"
+
+    assert main(
+        ["--data", str(path), "--preset", "frozen-es", "--symbol", "ESM6", "--format", "json"]
+    ) == 0
+    esm = json.loads(capsys.readouterr().out)
+    assert len(esm) == 1
+    assert esm[0]["entry_price"] == 5111.0
+    assert esm[0]["or_high"] == 5108.0
+
+
+def test_trigger_defaults_to_close_and_high_low_is_opt_in(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The research default is the close rule. ``--trigger high_low`` is separate."""
+    path = tmp_path / "one-session.csv"
+    _write_break_session(path, ["2024-01-16"])
+
+    assert main(["--data", str(path), "--format", "json"]) == 0
+    default = json.loads(capsys.readouterr().out)
+    assert default[0]["trigger"] == "close"
+    assert default[0]["entry_price"] == 11.0
+    assert default[0]["entry_ts"] == "2024-01-16T09:45:00-05:00"
+
+    assert main(["--data", str(path), "--trigger", "high_low", "--format", "json"]) == 0
+    pierced = json.loads(capsys.readouterr().out)
+    assert pierced[0]["trigger"] == "high_low"
+    assert pierced[0]["entry_price"] == 10.0
+    assert pierced[0]["entry_ts"] == "2024-01-16T09:45:00-05:00"
+    assert pierced[0]["direction"] == "long"
+
+
 def test_module_and_console_script_print_the_fixture() -> None:
     """``python -m orb`` and the ``orb-signals`` script share this pipeline."""
     module = _run([sys.executable, "-m", "orb", "--allow-synthetic", "--format", "json"])
@@ -251,6 +352,40 @@ def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+def _write_two_contracts(path: Path) -> None:
+    """Two ES quarterlies, each with a 09:30 box bar and a 10:04 close."""
+    rows: list[dict[str, object]] = []
+    specs = (
+        ("ESH6", 5000.0, 5008.0, 5011.0),
+        ("ESM6", 5100.0, 5108.0, 5111.0),
+    )
+    for symbol, low, high, break_close in specs:
+        for minute, bar_high, bar_low, close in (
+            (0, high, low, (high + low) / 2),
+            (34, break_close + 1, break_close - 1, break_close),
+        ):
+            stamp = pd.Timestamp("2024-01-16 09:30", tz=NY) + pd.Timedelta(minutes=minute)
+            utc = stamp.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%S") + ".000000000Z"
+            rows.append(
+                {
+                    "ts_event": utc,
+                    "rtype": 33,
+                    "publisher_id": 1,
+                    "instrument_id": 9000001,
+                    "open": close,
+                    "high": bar_high,
+                    "low": bar_low,
+                    "close": close,
+                    "volume": 10,
+                    "symbol": symbol,
+                }
+            )
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _write_break_session(path: Path, days: list[str]) -> None:

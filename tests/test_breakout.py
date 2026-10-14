@@ -590,14 +590,14 @@ def test_bundled_fixture_requires_allow_synthetic() -> None:
         load_ohlcv(sample_fixture_path(), symbol="MES", rth_only=True)
 
 
-def test_breakout_drops_rows_flagged_early_close() -> None:
-    """A flagged early-close day does not signal, even when it would break.
+def test_breakout_keeps_rows_flagged_early_close() -> None:
+    """A flagged early-close day still signals. The flag stays on the frame.
 
-    ``opening_ranges`` still sees that day. ``breakout_signals`` applies
-    ``signal_bars`` when the column is present, so the day is omitted.
-    There is no parameter that puts it back.
+    ``early_close`` is metadata. ``breakout_signals`` does not drop those
+    rows, and there is no parameter that removes them.
     """
     assert "include_early_close" not in inspect.signature(breakout_signals).parameters
+    assert "exclude_early_close" not in inspect.signature(breakout_signals).parameters
     assert list(inspect.signature(signal_bars).parameters) == ["bars"]
 
     early = _breakout_day("2024-01-16")
@@ -610,23 +610,21 @@ def test_breakout_drops_rows_flagged_early_close() -> None:
     assert ranges["session_date"].tolist() == [date(2024, 1, 16), date(2024, 1, 17)]
 
     signals = breakout_signals(bars, ranges)
-    assert signals == [_signal(date(2024, 1, 17), LONG, "09:45", 11.0)]
-    pd.testing.assert_frame_equal(bars, before)
-
-    plain = bars.drop(columns=["early_close"])
-    without_flag = breakout_signals(plain, opening_ranges(plain))
-    assert [signal.session_date for signal in without_flag] == [
-        date(2024, 1, 16),
-        date(2024, 1, 17),
+    assert signals == [
+        _signal(date(2024, 1, 16), LONG, "09:45", 11.0),
+        _signal(date(2024, 1, 17), LONG, "09:45", 11.0),
     ]
+    pd.testing.assert_frame_equal(bars, before)
+    assert bool(bars.loc[bars.index.date == date(2024, 1, 16), "early_close"].all())
 
 
-def test_recommended_path_emits_no_signal_on_early_close_sessions(tmp_path) -> None:
-    """load → signal_bars → opening_ranges → breakout_signals skips the halt.
+def test_recommended_path_includes_early_close_sessions(tmp_path) -> None:
+    """load → signal_bars → opening_ranges → breakout_signals keeps the halt.
 
     2024-07-03 is a CME equity early close (halt before 16:00 ET) with a
-    complete 15-minute opening range and a later close beyond it. 2024-07-05
-    is a full session with the same shape. Only the full session signals.
+    complete 15-minute opening range and a later close beyond it, still
+    before the halt. 2024-07-05 is a full session with the same shape.
+    Both sessions signal, and the early-close flag stays true.
     """
     path = tmp_path / "early-close-breakout.csv"
     _write_breakout_csv(
@@ -641,17 +639,49 @@ def test_recommended_path_emits_no_signal_on_early_close_sessions(tmp_path) -> N
     assert not bool(july5["early_close"].any())
 
     eligible = signal_bars(loaded)
-    assert _on_day(eligible, "2024-07-03").empty
+    july3_signals = _on_day(eligible, "2024-07-03")
+    assert not july3_signals.empty
+    assert bool(july3_signals["early_close"].all())
     ranges = opening_ranges(eligible)
-    assert ranges["session_date"].tolist() == [date(2024, 7, 5)]
+    assert ranges["session_date"].tolist() == [date(2024, 7, 3), date(2024, 7, 5)]
     signals = breakout_signals(eligible, ranges)
-    assert signals == [_signal(date(2024, 7, 5), LONG, "09:45", 11.0)]
+    assert signals == [
+        _signal(date(2024, 7, 3), LONG, "09:45", 11.0),
+        _signal(date(2024, 7, 5), LONG, "09:45", 11.0),
+    ]
 
     raw_ranges = opening_ranges(loaded)
     assert date(2024, 7, 3) in set(raw_ranges["session_date"])
     assert [signal.session_date for signal in breakout_signals(loaded, raw_ranges)] == [
-        date(2024, 7, 5)
+        date(2024, 7, 3),
+        date(2024, 7, 5),
     ]
+
+
+def test_early_close_entry_stops_at_the_session_halt() -> None:
+    """A shortened session does not signal at or after its close.
+
+    2024-07-03 halts at 13:00 ET. A 12:59 close can be the entry. A 13:30
+    close is past the halt, so that day emits nothing when it is the only
+    break.
+    """
+    before_halt = _session(
+        "2024-07-03",
+        RTH_OPEN,
+        1,
+        high=10.0,
+        low=6.0,
+        close=8.0,
+    )
+    at_1259 = _session("2024-07-03", 12 * 60 + 59, 1, high=12.0, low=11.0, close=11.5)
+    past_halt = _session("2024-07-03", 13 * 60 + 30, 1, high=14.0, low=13.0, close=13.5)
+    ranges = _ranges([(date(2024, 7, 3), 10.0, 6.0, 15)])
+
+    signaled = breakout_signals(pd.concat([before_halt, at_1259, past_halt]), ranges)
+    assert signaled == [_signal(date(2024, 7, 3), LONG, "12:59", 11.5)]
+
+    only_late = breakout_signals(pd.concat([before_halt, past_halt]), ranges)
+    assert only_late == []
 
 
 def test_signal_rejects_bad_direction_and_field_types() -> None:

@@ -1,19 +1,22 @@
 """Command-line entry for opening-range breakout signals.
 
 ``python -m orb`` and the ``orb-signals`` console script load a local
-OHLCV-1m file, drop early-close sessions, and print signals.
+OHLCV-1m file and print signals. Early-close sessions are included.
+``early_close`` stays metadata. An entry is not taken at or after the
+session close.
 
 The default mode is a research scan and is NOT the frozen ES ORB spec.
 It uses a complete opening range (default 15 minutes) and the first
-1-minute break, long or short, through 16:00 ET. The default trigger is
-close-only: a 1-minute close strictly beyond the range. ``--trigger
-high_low`` is opt-in.
+1-minute break, long or short, up to the session close (16:00 ET on a
+full day). The default trigger is close-only: a 1-minute close strictly
+beyond the range. ``--trigger high_low`` is opt-in.
 
 ``--preset frozen-es`` selects the spec signal: 30-minute box
 ``[09:30, 10:00)``, partial when minutes are missing, first clock-aligned
-5-minute close strictly above the box high, long only, no entry after the
-13:50-13:55 bucket. ``entry_ts`` is the bucket close minute (10:04 for
-the 10:00 bucket).
+5-minute close strictly above the box high, long only. The last bucket
+is the earlier of 13:50-13:55 and the session close. A bucket that would
+extend past that close does not trigger. ``entry_ts`` is the bucket
+close minute (10:04 for the 10:00 bucket).
 
 The default file is the bundled synthetic fixture, which ``load_ohlcv``
 refuses unless ``--allow-synthetic`` is passed through as
@@ -88,7 +91,8 @@ def _parser() -> argparse.ArgumentParser:
         prog="orb-signals",
         description=(
             "Load OHLCV-1m bars and print opening-range breakout signals. "
-            "Early-close sessions are always excluded. "
+            "Early-close sessions are included. The early_close flag is metadata. "
+            "Entries stop at the session close. "
             "This command does not size positions, choose exits, or compute P&L. "
             "The default mode is a research scan and is NOT the frozen ES ORB spec: "
             "a complete opening range (default 15 minutes) and the first 1-minute "
@@ -188,10 +192,10 @@ def _signals(
 ) -> list[Signal]:
     """Load bars and return one breakout per eligible session.
 
-    ``signal_bars`` drops early-close sessions and has no switch that puts
-    them back. The research path then calls ``opening_ranges`` and
+    ``signal_bars`` keeps early-close sessions and has no switch that
+    drops them. The research path then calls ``opening_ranges`` and
     ``breakout_signals``. ``--preset frozen-es`` calls ``frozen_es_signals``
-    instead.
+    instead. Entries stop at the session close.
     """
     if preset == FROZEN_ES_PRESET:
         if window_minutes is not None:

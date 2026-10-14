@@ -9,13 +9,14 @@ import shutil
 import site
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from orb.cli import main
-from orb.loader import sample_fixture_path
+from orb.loader import load_ohlcv, sample_fixture_path, signal_bars
 
 NY = "America/New_York"
 REPO = Path(__file__).resolve().parents[1]
@@ -186,24 +187,30 @@ def test_missing_data_exits_nonzero(capsys: pytest.CaptureFixture[str], tmp_path
     assert missing.name in captured.err
 
 
-def test_early_close_sessions_are_excluded(
+def test_early_close_sessions_are_included(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    """The CLI runs signal_bars, so a holiday short session never signals.
+    """The CLI keeps a holiday short session and preserves the flag.
 
     2024-07-03 is a CME equity early close with a complete opening range
-    and a later close beyond it. 2024-07-05 is a full session of the same
-    shape. Only the full session is printed. There is no flag to put the
-    early close back.
+    and a later close beyond it, still before the halt. 2024-07-05 is a
+    full session of the same shape. Both are printed. There is no switch
+    that drops the early close.
     """
     path = tmp_path / "early-close.csv"
     _write_break_session(path, ["2024-07-03", "2024-07-05"])
+    loaded = load_ohlcv(path, symbol="MES")
+    kept = signal_bars(loaded)
+    assert bool(kept.loc[kept.index.date == date(2024, 7, 3), "early_close"].all())
+    assert not bool(kept.loc[kept.index.date == date(2024, 7, 5), "early_close"].any())
+
     assert main(["--data", str(path), "--format", "json"]) == 0
     signals = json.loads(capsys.readouterr().out)
-    assert [row["session_date"] for row in signals] == ["2024-07-05"]
-    assert signals[0]["direction"] == "long"
-    assert signals[0]["entry_price"] == 11.0
-    assert signals[0]["entry_ts"] == "2024-07-05T09:45:00-04:00"
+    assert [row["session_date"] for row in signals] == ["2024-07-03", "2024-07-05"]
+    assert [row["direction"] for row in signals] == ["long", "long"]
+    assert [row["entry_price"] for row in signals] == [11.0, 11.0]
+    assert signals[0]["entry_ts"] == "2024-07-03T09:45:00-04:00"
+    assert signals[1]["entry_ts"] == "2024-07-05T09:45:00-04:00"
 
     with pytest.raises(SystemExit) as exc:
         main(["--data", str(path), "--include-early-close"])

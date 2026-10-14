@@ -8,17 +8,17 @@ Regular trading hours are the equity cash window ``[09:30, 16:00)`` ET,
 intersected with the CME equity calendar (``CME_Equity``). Weekends and full
 holidays are not sessions. Holiday short sessions, when futures still trade
 a shortened day (July 4, Thanksgiving, MLK Day, and any other CME equity halt
-before 16:00 ET), are early closes: the window ends at the halt, the session
-is flagged ``early_close``, and :func:`signal_bars` always drops it. Those
-sessions stay in the loaded frame and in the RTH gap report. That exclusion
-is fixed.
+before 16:00 ET), are early closes: the window ends at the halt and the
+session is flagged ``early_close``. That flag is metadata.
+:func:`signal_bars` keeps those sessions. They stay in the loaded frame
+and in the RTH gap report.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -126,8 +126,8 @@ def load_ohlcv(
         eligible for that gap report.
 
         Early-close sessions stay in this frame so the flag is visible.
-        :func:`signal_bars` always removes them. There is no switch to put
-        them back.
+        :func:`signal_bars` keeps them. The flag is metadata; there is no
+        switch that drops those sessions from the signal set.
     """
     path = Path(path)
     frame = _read_table(path)
@@ -155,17 +155,16 @@ def load_ohlcv(
 def signal_bars(bars: pd.DataFrame) -> pd.DataFrame:
     """Return bars that later signal code may use.
 
-    Early-close sessions are always excluded. This is a fixed rule: there is
-    no parameter that puts those sessions back into the signal set. The
-    ``early_close`` column on :func:`load_ohlcv` output is how a session is
-    recognized; this function applies the exclusion.
+    Early-close sessions are included. ``early_close`` stays on the frame
+    as metadata. This function does not drop those rows and has no switch
+    that removes them. The column is required so a session can still be
+    recognized. The returned frame is a copy.
     """
     if "early_close" not in bars.columns:
         raise ValueError(
             "bars have no early_close column; pass the frame returned by load_ohlcv"
         )
-    keep = ~bars["early_close"].to_numpy(dtype=bool)
-    return bars.iloc[np.flatnonzero(keep)].copy()
+    return bars.copy()
 
 
 def rth_gap_report(bars: pd.DataFrame) -> pd.DataFrame:
@@ -504,6 +503,61 @@ def _session_rth(
             continue
         windows[session_date] = (open_rth, min(close_ny, regular_close))
     return windows, early_dates
+
+
+# The pinned CME_Equity calendar ends an afternoon early close at 13:00 ET.
+# On some of those days the ES RTH tape still prints 13:00 through 13:14,
+# which is a 13:15 halt (2022-11-25, 2023-07-03, 2025-07-03, and similar).
+CALENDAR_AFTERNOON_EARLY_CLOSE_MINUTES = 13 * 60
+ES_EARLY_TAPE_CLOSE_MINUTES = 13 * 60 + 15
+
+
+def calendar_rth_close_minute(session_date) -> int | None:
+    """Exclusive CME equity close, as minutes from midnight in New York.
+
+    A full session is 16:00 or later (the electronic halt can be 17:00; the
+    cash window used for signals is capped at 16:00 by the caller). An
+    early close is the halt, including a halt at or before 09:30. A date
+    with no session returns ``None``.
+    """
+    return _closes_for_year(session_date.year).get(session_date)
+
+
+def entry_cutoff_minute(session_date, observed_minutes) -> int:
+    """Exclusive minute-of-day an entry scan must stay below.
+
+    Full sessions end at 16:00. An early close ends at the CME halt. When
+    that halt is 13:00 and ``observed_minutes`` still contains a bar in
+    ``[13:00, 13:15)``, the close is 13:15 so the 13:14 bar can complete
+    an entry and a bucket that runs past 13:15 cannot. A date with no CME
+    session uses 16:00.
+    """
+    close = calendar_rth_close_minute(session_date)
+    if close is None or close > RTH_CLOSE_MINUTES:
+        return RTH_CLOSE_MINUTES
+    observed = np.asarray(observed_minutes)
+    if (
+        close == CALENDAR_AFTERNOON_EARLY_CLOSE_MINUTES
+        and observed.size
+        and bool(
+            ((observed >= close) & (observed < ES_EARLY_TAPE_CLOSE_MINUTES)).any()
+        )
+    ):
+        return ES_EARLY_TAPE_CLOSE_MINUTES
+    return close
+
+
+@lru_cache(maxsize=16)
+def _closes_for_year(year: int) -> dict:
+    start = date(year, 1, 1)
+    end = date(year, 12, 31)
+    schedule = _cme_equity_calendar().schedule(start_date=start, end_date=end)
+    closes: dict = {}
+    for session, row in schedule.iterrows():
+        session_date = _session_date(session)
+        close_ny = pd.Timestamp(row["market_close"]).tz_convert(NY_TZ)
+        closes[session_date] = close_ny.hour * 60 + close_ny.minute
+    return closes
 
 
 def _session_date(session) -> object:

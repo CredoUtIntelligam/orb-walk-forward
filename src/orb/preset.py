@@ -13,10 +13,13 @@ follows the frozen spec's signal rule and nothing past that signal:
   13:50. The 5-minute close is the 1-minute close at ``t+4`` (the 10:00
   bucket is stamped 10:04). The 13:55 bucket is not eligible.
 - Long only. One signal per session. ``entry_price`` is that close.
+- The last bucket is the earlier of the 13:50-13:55 spec bucket and the
+  session close. A 5-minute bucket that would extend past that close
+  does not trigger. Early-close sessions are included. ``early_close``
+  is metadata and is not a reason to drop the day.
 
-Early-close sessions stay excluded when the frame carries
-``early_close``. This function does not place a stop, choose a target,
-flatten, size a position, or compute P&L.
+This function does not place a stop, choose a target, flatten, size a
+position, or compute P&L.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from orb.breakout import LONG, TRIGGER_CLOSE_5M, Signal
-from orb.loader import NY_TZ, signal_bars
+from orb.loader import NY_TZ, entry_cutoff_minute, signal_bars
 
 FROZEN_ES_PRESET = "frozen-es"
 FROZEN_ES_WINDOW_MINUTES = 30
@@ -67,18 +70,21 @@ def frozen_es_signals(bars: pd.DataFrame) -> list[Signal]:
         1-minute OHLCV. The index must be a timezone-aware
         ``DatetimeIndex``. America/New_York is used as-is; any other zone
         is converted before the clock is applied. Naive timestamps are
-        rejected. Pass ``signal_bars(load_ohlcv(...))`` when early-close
-        sessions should already be gone. If ``early_close`` is still
-        present, those rows are dropped here. There is no switch that
-        puts them back. A frame without the column is scanned as given.
+        rejected. Pass ``signal_bars(load_ohlcv(...))``. If
+        ``early_close`` is still present, those rows are kept and the
+        flag stays metadata. There is no switch that drops them. The
+        entry cutoff is the earlier of 13:55 ET and that session's
+        close, and a bucket that would extend past the close is skipped.
+        A frame without the column is scanned as given.
 
     Returns
     -------
     list[Signal]
         Long signals in session-date order. ``window_minutes`` is 30 and
         ``trigger`` is ``"close_5m"``. ``entry_ts`` is the bucket close
-        minute. Days with no 09:30 bar, an empty box, or no 5-minute
-        close strictly above the box high are omitted.
+        minute. Days with no 09:30 bar, an empty box, or no eligible
+        5-minute close strictly above the box high are omitted. An
+        early-close session can still emit a signal.
     """
     frame = _prepare_bars(bars)
     if frame.empty:
@@ -111,6 +117,8 @@ def _prepare_bars(bars: pd.DataFrame) -> pd.DataFrame:
         frame.index = bars.index.tz_convert(NY_TZ)
     if frame.index.isna().any():
         raise ValueError("bars index contains missing timestamps")
+    # Keep early-close rows. ``signal_bars`` copies the frame and leaves
+    # the flag in place.
     if "early_close" in frame.columns:
         frame = signal_bars(frame)
     _reject_multiple_symbols(frame)
@@ -172,7 +180,13 @@ def _signal_for_day(day: pd.DataFrame, session_date: date) -> Signal | None:
             strict=True,
         )
     }
+    # Spec last bucket ends at 13:55. A shortened session ends sooner.
+    # ``end > cutoff`` rejects a bucket that would extend past the close.
+    session_close = entry_cutoff_minute(session_date, np.asarray(selected_minutes))
+    cutoff = min(LAST_BUCKET_MINUTES + BUCKET_WIDTH_MINUTES, session_close)
     for start in _BUCKET_STARTS:
+        if start + BUCKET_WIDTH_MINUTES > cutoff:
+            break
         found = close_at.get(start + CLOSE_OFFSET_MINUTES)
         if found is None:
             continue

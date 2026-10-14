@@ -491,12 +491,14 @@ def test_rth_uses_cme_calendar_for_holidays_weekends_and_early_halts(
     raw = load_ohlcv(path)
     good_friday = _on(raw, "2024-03-29")
     assert bool(good_friday["early_close"].all())
-    assert _on(signal_bars(raw), "2024-03-29").empty
+    kept = _on(signal_bars(raw), "2024-03-29")
+    assert not kept.empty
+    assert bool(kept["early_close"].all())
     christmas = _on(raw, "2024-12-25")
     assert not bool(christmas["early_close"].any())
 
 
-def test_early_close_sessions_are_flagged_and_excluded_from_signals(
+def test_early_close_sessions_are_flagged_and_kept_for_signals(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "early.csv"
@@ -526,10 +528,12 @@ def test_early_close_sessions_are_flagged_and_excluded_from_signals(
     assert not bool(_on(rth, "2024-07-05")["early_close"].any())
 
     signals = signal_bars(rth)
-    assert _on(signals, "2024-07-03").empty
-    assert _on(signals, "2024-07-04").empty
+    assert _clocks(_on(signals, "2024-07-03")) == [(9, 30), (12, 59)]
+    assert bool(_on(signals, "2024-07-03")["early_close"].all())
+    assert _clocks(_on(signals, "2024-07-04")) == [(9, 30)]
+    assert bool(_on(signals, "2024-07-04")["early_close"].all())
     assert _clocks(_on(signals, "2024-07-05")) == [(9, 30), (15, 59)]
-    assert not bool(signals["early_close"].any())
+    assert not bool(_on(signals, "2024-07-05")["early_close"].any())
 
     gaps = rth_gap_report(rth)
     july3 = gaps[gaps["session"] == "2024-07-03"]
@@ -759,8 +763,8 @@ def test_holiday_short_sessions_are_early_closes_and_keep_gap_reports(
 ) -> None:
     """July 4, Thanksgiving, and MLK trade a shortened futures session.
 
-    Those days are early closes: flagged, always excluded from signals, and
-    still present in the RTH gap report out to the early halt.
+    Those days are early closes: flagged, kept for signals, and still
+    present in the RTH gap report out to the early halt.
     """
     path = tmp_path / "short-holidays.csv"
     days = ("2024-01-15", "2024-07-04", "2024-11-28")
@@ -771,7 +775,8 @@ def test_holiday_short_sessions_are_early_closes_and_keep_gap_reports(
     _write_csv(path, rows)
 
     rth = load_ohlcv(path, rth_only=True)
-    assert signal_bars(rth).empty
+    kept = signal_bars(rth)
+    assert len(kept) == len(rth)
     gaps = rth_gap_report(rth)
     for day in days:
         session = _on(rth, day)
@@ -782,7 +787,9 @@ def test_holiday_short_sessions_are_early_closes_and_keep_gap_reports(
         assert not reported.empty
         assert reported["end"].max() == halt
         assert not bool((reported["start"] >= halt).any())
-        assert _on(signal_bars(rth), day).empty
+        kept_day = _on(kept, day)
+        assert _clocks(kept_day) == [(9, 30)]
+        assert bool(kept_day["early_close"].all())
 
 
 @pytest.mark.parametrize("column", ["open", "high", "low", "close"])

@@ -38,13 +38,13 @@ sides on one bar is a ``high_low`` case.
 ``entry_price`` is a reference on the signal. It is not a fill. This
 module does not size a position, choose a stop or target, or compute P&L.
 
-Early-close sessions are not signaled. Callers should pass
+Early-close sessions are included. Callers should pass
 ``signal_bars(load_ohlcv(...))`` into both ``opening_ranges`` and
 ``breakout_signals``, so the range table and the scan cover the same
-sessions. ``signal_bars`` always drops sessions flagged ``early_close``,
-including holiday short sessions, and has no parameter that puts them
-back. When ``bars`` still carries that column, this function applies the
-same drop before it scans.
+sessions. ``signal_bars`` keeps sessions flagged ``early_close``,
+including holiday short sessions. The ``early_close`` flag is
+metadata: when ``bars`` still carries that column, this function keeps
+those rows. An entry is not taken at or after that session's close.
 """
 
 from __future__ import annotations
@@ -56,7 +56,13 @@ from typing import Literal, TypedDict
 import numpy as np
 import pandas as pd
 
-from orb.loader import NY_TZ, RTH_CLOSE_MINUTES, RTH_OPEN_MINUTES, signal_bars
+from orb.loader import (
+    NY_TZ,
+    RTH_CLOSE_MINUTES,
+    RTH_OPEN_MINUTES,
+    entry_cutoff_minute,
+    signal_bars,
+)
 
 DEFAULT_TRIGGER = "close"
 TRIGGER_CLOSE = "close"
@@ -183,8 +189,9 @@ def breakout_signals(
         timestamps are rejected. The frame is not modified.
 
         Pass the frame from ``signal_bars(load_ohlcv(...))``. If
-        ``early_close`` is still present, rows with that flag set are
-        dropped before the scan. There is no parameter that keeps them.
+        ``early_close`` is still present, those rows are kept and the
+        flag stays metadata. There is no parameter that drops them.
+        Entries on a shortened session stop at that session's close.
         A frame without the column is scanned as given, which is how
         hand-built bars that never came from the loader are accepted.
     ranges:
@@ -257,8 +264,8 @@ def _prepare_bars(bars: pd.DataFrame) -> pd.DataFrame:
 
     if frame.index.isna().any():
         raise ValueError("bars index contains missing timestamps")
-    # Same rule as ``signal_bars``: early-close sessions never signal.
-    # Frames built without the column are left unchanged.
+    # ``signal_bars`` keeps early-close rows and the flag. Calling it
+    # when the column is present copies that frame without dropping days.
     if "early_close" in frame.columns:
         frame = signal_bars(frame)
     _reject_multiple_symbols(frame)
@@ -385,7 +392,8 @@ def _signal_for_day(
     session: _RangeSession,
     trigger: str,
 ) -> Signal | None:
-    eligible = _eligible_bars(day, session["window_minutes"])
+    cutoff = _session_cutoff(day, session["session_date"])
+    eligible = _eligible_bars(day, session["window_minutes"], cutoff)
     range_high = session["range_high"]
     range_low = session["range_low"]
     for timestamp, row in eligible.iterrows():
@@ -417,13 +425,23 @@ def _signal_for_day(
     return None
 
 
-def _eligible_bars(day: pd.DataFrame, window_minutes: int) -> pd.DataFrame:
+def _session_cutoff(day: pd.DataFrame, session_date: date) -> int:
+    index = day.index
+    aligned = (index.second == 0) & (index.microsecond == 0) & (index.nanosecond == 0)
+    minutes = index.hour * 60 + index.minute
+    return entry_cutoff_minute(session_date, np.asarray(minutes[aligned]))
+
+
+def _eligible_bars(
+    day: pd.DataFrame, window_minutes: int, cutoff_minute: int
+) -> pd.DataFrame:
     index = day.index
     minute_of_day = index.hour * 60 + index.minute
-    # ``[09:30 + W, 16:00)``. The window itself is ``[09:30, 09:30 + W)``.
+    # ``[09:30 + W, session close)``. The window itself is ``[09:30, 09:30 + W)``.
+    # ``cutoff_minute`` is 16:00 on a full session and the halt on an early close.
     start = RTH_OPEN_MINUTES + window_minutes
     aligned = (index.second == 0) & (index.microsecond == 0) & (index.nanosecond == 0)
-    in_session = (minute_of_day >= start) & (minute_of_day < RTH_CLOSE_MINUTES)
+    in_session = (minute_of_day >= start) & (minute_of_day < cutoff_minute)
     return day.loc[in_session & aligned]
 
 

@@ -141,8 +141,8 @@ def test_close_below_the_low_does_not_signal() -> None:
     assert frozen_es_signals(bars) == []
 
 
-def test_early_close_sessions_stay_excluded() -> None:
-    """A flagged early-close day does not signal under the preset either."""
+def test_early_close_sessions_are_included_and_the_flag_stays() -> None:
+    """A flagged early-close day still signals. The caller's flag is unchanged."""
     early = _frame(
         [
             ("2024-07-03", OPEN, 10.0, 6.0, 8.0),
@@ -157,8 +157,65 @@ def test_early_close_sessions_stay_excluded() -> None:
         ],
         early_close=False,
     )
-    signals = frozen_es_signals(pd.concat([early, regular]))
-    assert [signal.session_date for signal in signals] == [date(2024, 7, 5)]
+    bars = pd.concat([early, regular])
+    before = bars.copy()
+    signals = frozen_es_signals(bars)
+    assert [signal.session_date for signal in signals] == [
+        date(2024, 7, 3),
+        date(2024, 7, 5),
+    ]
+    assert signals[0].entry_ts == pd.Timestamp("2024-07-03 10:04", tz=NY)
+    assert signals[0].entry_price == 11.5
+    pd.testing.assert_frame_equal(bars, before)
+    assert bool(bars.loc[bars.index.date == date(2024, 7, 3), "early_close"].all())
+
+
+def test_early_close_buckets_cannot_extend_past_the_session_close() -> None:
+    """The last bucket is min(13:50-13:55, the session close).
+
+    2023-07-03 prints through 13:14, so the close is 13:15 and the 13:10
+    bucket can fire. The 13:15 bucket cannot. 2024-07-04 halts at 13:00,
+    so a 13:54 bar does not fire and a 12:59 close can.
+    """
+    through_1314 = _frame(
+        [
+            ("2023-07-03", OPEN, 10.0, 6.0, 8.0),
+            ("2023-07-03", 13 * 60 + 14, 12.0, 11.0, 11.5),
+        ]
+    )
+    fired = frozen_es_signals(through_1314)
+    assert len(fired) == 1
+    assert fired[0].entry_ts == pd.Timestamp("2023-07-03 13:14", tz=NY)
+    assert fired[0].entry_price == 11.5
+    assert fired[0].direction == "long"
+
+    past_1315 = _frame(
+        [
+            ("2023-07-03", OPEN, 10.0, 6.0, 8.0),
+            ("2023-07-03", 13 * 60 + 14, 9.0, 7.0, 8.0),
+            ("2023-07-03", 13 * 60 + 19, 12.0, 11.0, 11.5),
+        ]
+    )
+    assert frozen_es_signals(past_1315) == []
+
+    halt_at_1300 = _frame(
+        [
+            ("2024-07-04", OPEN, 10.0, 6.0, 8.0),
+            ("2024-07-04", 12 * 60 + 59, 12.0, 11.0, 11.5),
+            ("2024-07-04", 13 * 60 + 54, 20.0, 19.0, 19.5),
+        ]
+    )
+    at_noon = frozen_es_signals(halt_at_1300)
+    assert len(at_noon) == 1
+    assert at_noon[0].entry_ts == pd.Timestamp("2024-07-04 12:59", tz=NY)
+
+    only_spec_bucket = _frame(
+        [
+            ("2024-07-04", OPEN, 10.0, 6.0, 8.0),
+            ("2024-07-04", 13 * 60 + 54, 20.0, 19.0, 19.5),
+        ]
+    )
+    assert frozen_es_signals(only_spec_bucket) == []
 
 
 def _frame(

@@ -41,7 +41,7 @@ Python 3.10+. Runtime dependencies are pandas, numpy, pyarrow, tzdata, and pinne
 
 Pass `symbol` to keep one instrument. Pass `rth_only=True` to keep CME equity regular trading hours: `[09:30, 16:00)` ET on a full session, using the `CME_Equity` calendar for weekends, full holidays, and early closes. 16:00 is exclusive because these bars are stamped at the start of the minute; the last full-session bar starts at 15:59. An earlier exchange halt shortens that window. Missing minutes inside a session are reported (`rth_gap_before` and `rth_gap_report`) and are never filled.
 
-Holiday short sessions, when futures still trade a shortened day (July 4, Thanksgiving, MLK Day, and other CME equity halts before 16:00 ET), are early closes. They are flagged on `early_close`, stay in the loaded frame, and stay eligible for the gap report. `signal_bars` always removes them. That exclusion is fixed; there is no switch to include early-close sessions in signals.
+Holiday short sessions, when futures still trade a shortened day (July 4, Thanksgiving, MLK Day, and other CME equity halts before 16:00 ET), are early closes. They are flagged on `early_close`, stay in the loaded frame, and stay eligible for the gap report and for signals. `signal_bars` keeps them. The flag is metadata; there is no switch that drops those sessions. An entry scan stops at the session close, which is the halt on a shortened day. When the CME calendar halt is 13:00 and the tape still prints a bar in `[13:00, 13:15)`, that close is 13:15 so the 13:14 bar can complete an entry.
 
 ```python
 from orb import (
@@ -73,13 +73,13 @@ The window starts at 09:30 ET. `window_minutes` defaults to 15 and can be 5, 30,
 
 A session is kept only when every minute in the window is present exactly once. A missing minute, a duplicate stamp, or a sub-minute timestamp inside the window drops that day. Bars outside the window, including 09:29 and the 16:00 bar, are ignored. Pass one symbol; a frame that still contains more than one symbol is rejected so two instruments are not blended into one range.
 
-Build ranges from `signal_bars(load_ohlcv(...))` when they will feed breakout signals. `opening_ranges` itself does not drop `early_close` rows, so an unfiltered frame can still produce a range for a holiday short session. Those ranges should not be paired with the unfiltered bars if the goal is a signal.
+Build ranges from `signal_bars(load_ohlcv(...))` when they will feed breakout signals, so the range table and the scan cover the same sessions. `opening_ranges` does not drop `early_close` rows. A holiday short session with a complete window still produces a range.
 
 ## Breakout signals
 
 `breakout_signals` takes those bars and that range table and returns a `list[Signal]`. Each `Signal` has `session_date`, `direction` (`"long"` or `"short"`), `or_high`, `or_low`, `entry_ts` (start of the triggering minute, America/New_York), `entry_price`, `window_minutes`, and `trigger` (`"close"` or `"high_low"`). `to_dict()` returns those fields with dates and timestamps as ISO-8601 strings. The record is frozen, and `__post_init__` checks the direction and the field types. At most one signal is returned per session date. This research function is not the frozen ES ORB spec.
 
-A session emits at most one signal: the first eligible bar that breaks the range. Later bars that day are ignored, including a break of the other side. A session with no break is omitted. Eligible bars are minute-aligned stamps in `[09:30 + window_minutes, 16:00)` ET. Bars inside the opening-range window, and bars at or after 16:00, do not signal. `window_minutes` comes from each range row.
+A session emits at most one signal: the first eligible bar that breaks the range. Later bars that day are ignored, including a break of the other side. A session with no break is omitted. Eligible bars are minute-aligned stamps in `[09:30 + window_minutes, session close)` ET. A full session closes at 16:00. An early close stops at the halt. Bars inside the opening-range window, and bars at or after the session close, do not signal. `window_minutes` comes from each range row.
 
 The default trigger is close-only: `"close"`. Long means the bar closes strictly above the opening-range high. Short means it closes strictly below the opening-range low. A wick through the level with the close back inside the range is not a breakout. `entry_price` is that close. `high_low` is opt-in.
 
@@ -87,7 +87,7 @@ The default trigger is close-only: `"close"`. Long means the bar closes strictly
 
 `entry_price` is a reference on the signal, not a fill. The function does not size a position or compute P&L.
 
-Early-close sessions are excluded from signals. The recommended path is `load_ohlcv`, then `signal_bars`, then `opening_ranges`, then `breakout_signals`. When the bar frame still has an `early_close` column, `breakout_signals` drops rows where that flag is true before it scans. There is no parameter that puts those sessions back.
+Early-close sessions are included in signals. The recommended path is `load_ohlcv`, then `signal_bars`, then `opening_ranges`, then `breakout_signals`. When the bar frame still has an `early_close` column, `breakout_signals` keeps those rows and the flag. There is no parameter that drops them. The entry cutoff is that session's close.
 
 ## CLI
 
@@ -95,11 +95,11 @@ Early-close sessions are excluded from signals. The recommended path is `load_oh
 
 The default mode is the research scan above. It is **not** the frozen ES ORB spec. `--window` is the opening-range length in minutes (default 15) and the session must contain every minute. `--trigger` is `close` or `high_low`. The default is close-only (`close`): the first 1-minute close strictly beyond the range. `high_low` is opt-in.
 
-`--preset frozen-es` is the spec signal, via `frozen_es_signals`. The box is `[09:30, 10:00)` America/New_York. A missing minute after 09:30 still produces a partial range (max high, min low of the bars present). A day is skipped only when the 09:30 bar is absent or the box is empty. The trigger is the first clock-aligned 5-minute close strictly above the box high, long only. Buckets run 10:00, 10:05, ..., 13:50. Each bucket is `[t, t+5)` and the close is the 1-minute bar at `t+4`, so the 10:00 bucket is stamped 10:04. The 13:55 bucket is not eligible. `--window` and `--trigger` do not apply under the preset. The preset does not place a stop, choose a target, or compute P&L.
+`--preset frozen-es` is the spec signal, via `frozen_es_signals`. The box is `[09:30, 10:00)` America/New_York. A missing minute after 09:30 still produces a partial range (max high, min low of the bars present). A day is skipped only when the 09:30 bar is absent or the box is empty. The trigger is the first clock-aligned 5-minute close strictly above the box high, long only. Buckets run 10:00, 10:05, ..., 13:50. Each bucket is `[t, t+5)` and the close is the 1-minute bar at `t+4`, so the 10:00 bucket is stamped 10:04. The last eligible bucket ends at the earlier of 13:55 and the session close, so a shortened day cannot trigger a bucket that would extend past the halt. `--window` and `--trigger` do not apply under the preset. The preset does not place a stop, choose a target, or compute P&L.
 
 `--symbol` keeps one symbol, which is how a multi-contract Databento file is narrowed to one outright. The default input is the bundled synthetic fixture. `load_ohlcv` refuses that content unless `--allow-synthetic` is set, which is passed through as `allow_synthetic=True`. `--data` selects another local CSV or Parquet file. A renamed copy of the fixture is still refused without the flag, because the check is the loader's content checksum, not the file name.
 
-Early-close sessions stay excluded; the CLI always calls `signal_bars` and has no flag that puts them back. Stdout is a readable table or JSON (`--format table` or `--format json`). `--out` writes a file instead of stdout, CSV or JSON by the extension.
+Early-close sessions stay included; the CLI always calls `signal_bars` and has no flag that drops them. Stdout is a readable table or JSON (`--format table` or `--format json`). `--out` writes a file instead of stdout, CSV or JSON by the extension.
 
 Loader failures, including a missing path and a refused synthetic file, print a one-line error and exit nonzero.
 

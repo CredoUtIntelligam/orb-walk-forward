@@ -12,10 +12,13 @@ break of the other side. A session that never breaks is omitted.
 
 The opening range occupies ``[09:30, 09:30 + W)`` America/New_York, where
 ``W`` is that session's ``window_minutes``. Eligible bars are
-minute-aligned stamps in ``[09:30 + W, 16:00)``. Bars inside the window,
-bars before 09:30, and bars at or after 16:00 do not signal. Sub-minute
-stamps are ignored. 16:00 is exclusive because these bars are stamped at
-the start of the minute, matching the loader's regular-hours filter.
+minute-aligned stamps in ``[09:30 + W, session close)``. A full session
+closes at 16:00 ET. An early close stops at the halt, which is 13:15 when
+the tape still prints a bar in ``[13:00, 13:15)`` on a calendar 13:00 day.
+Bars inside the window, bars before 09:30, and bars at or after the
+session close do not signal. Sub-minute stamps are ignored. The close is
+exclusive because these bars are stamped at the start of the minute,
+matching the loader's regular-hours filter.
 
 Two trigger rules are supported. Both use a strict comparison, so a print
 that only tags the level is not a breakout.
@@ -50,7 +53,7 @@ those rows. An entry is not taken at or after that session's close.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Literal, TypedDict
 
 import numpy as np
@@ -60,6 +63,7 @@ from orb.loader import (
     NY_TZ,
     RTH_CLOSE_MINUTES,
     RTH_OPEN_MINUTES,
+    calendar_rth_close_minute,
     entry_cutoff_minute,
     signal_bars,
 )
@@ -111,7 +115,10 @@ class Signal:
     close for ``"close"`` and for ``"close_5m"``, and the broken level
     (``or_high`` or ``or_low``) for ``"high_low"``. ``window_minutes`` is
     the opening-range length that produced the levels. ``trigger`` is
-    ``"close"``, ``"high_low"``, or ``"close_5m"``.
+    ``"close"``, ``"high_low"``, or ``"close_5m"``. ``early_close`` is
+    whether that session halted before 16:00 ET. ``session_close`` is the
+    exclusive America/New_York clock the scan used (``13:00``, ``13:15``,
+    or ``16:00`` on the sessions this package distinguishes).
 
     ``__post_init__`` checks those types and the direction. ``to_dict``
     returns JSON-safe values. The record stays frozen.
@@ -125,6 +132,8 @@ class Signal:
     entry_price: float
     window_minutes: int
     trigger: str
+    early_close: bool
+    session_close: time
 
     def __post_init__(self) -> None:
         session_date = _require_session_date(self.session_date)
@@ -135,6 +144,8 @@ class Signal:
         entry_price = _require_price(self.entry_price, "entry_price")
         window_minutes = _require_window_minutes(self.window_minutes)
         trigger = _require_signal_trigger(self.trigger)
+        early_close = _require_early_close(self.early_close)
+        session_close = _require_session_close(self.session_close)
         object.__setattr__(self, "session_date", session_date)
         object.__setattr__(self, "direction", direction)
         object.__setattr__(self, "or_high", or_high)
@@ -143,12 +154,15 @@ class Signal:
         object.__setattr__(self, "entry_price", entry_price)
         object.__setattr__(self, "window_minutes", window_minutes)
         object.__setattr__(self, "trigger", trigger)
+        object.__setattr__(self, "early_close", early_close)
+        object.__setattr__(self, "session_close", session_close)
 
     def to_dict(self) -> dict[str, object]:
         """Return JSON-safe fields.
 
         Dates and timestamps are ISO-8601 strings. Prices are ``float``
-        and ``window_minutes`` is ``int``.
+        and ``window_minutes`` is ``int``. ``early_close`` is a ``bool``.
+        ``session_close`` is ``HH:MM`` in America/New_York.
         """
         return {
             "session_date": self.session_date.isoformat(),
@@ -159,6 +173,8 @@ class Signal:
             "entry_price": self.entry_price,
             "window_minutes": self.window_minutes,
             "trigger": self.trigger,
+            "early_close": self.early_close,
+            "session_close": self.session_close.strftime("%H:%M"),
         }
 
 
@@ -412,6 +428,7 @@ def _signal_for_day(
         else:
             direction = SHORT
             entry_price = short_price
+        early_close, session_close = _session_facts(day, session["session_date"])
         return Signal(
             session_date=session["session_date"],
             direction=direction,
@@ -421,15 +438,50 @@ def _signal_for_day(
             entry_price=float(entry_price),
             window_minutes=session["window_minutes"],
             trigger=trigger,
+            early_close=early_close,
+            session_close=session_close,
         )
     return None
 
 
 def _session_cutoff(day: pd.DataFrame, session_date: date) -> int:
+    return entry_cutoff_minute(session_date, _aligned_minutes(day))
+
+
+def _session_facts(day: pd.DataFrame, session_date: date) -> tuple[bool, time]:
+    """Flag and exclusive ET close actually applied to this session."""
+    cutoff = _session_cutoff(day, session_date)
+    return _early_close_flag(day, session_date), _clock(cutoff)
+
+
+def _aligned_minutes(day: pd.DataFrame) -> np.ndarray:
     index = day.index
     aligned = (index.second == 0) & (index.microsecond == 0) & (index.nanosecond == 0)
     minutes = index.hour * 60 + index.minute
-    return entry_cutoff_minute(session_date, np.asarray(minutes[aligned]))
+    return np.asarray(minutes[aligned])
+
+
+def _early_close_flag(day: pd.DataFrame, session_date: date) -> bool:
+    if "early_close" in day.columns:
+        flags = day["early_close"]
+        if flags.isna().any():
+            raise ValueError("early_close contains missing values")
+        values = {_as_bool(value) for value in flags.tolist()}
+        if len(values) != 1:
+            raise ValueError("early_close must be the same for every bar in a session")
+        return values.pop()
+    calendar = calendar_rth_close_minute(session_date)
+    return calendar is not None and calendar < RTH_CLOSE_MINUTES
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    raise ValueError("early_close must be a bool")
+
+
+def _clock(minutes: int) -> time:
+    return time(minutes // 60, minutes % 60)
 
 
 def _eligible_bars(
@@ -515,6 +567,22 @@ def _require_signal_trigger(value: object) -> str:
     if not isinstance(value, str) or value not in SIGNAL_TRIGGERS:
         raise ValueError("trigger must be 'close', 'high_low', or 'close_5m'")
     return value
+
+
+def _require_early_close(value: object) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    raise TypeError("early_close must be a bool")
+
+
+def _require_session_close(value: object) -> time:
+    if not isinstance(value, time) or isinstance(value, datetime):
+        raise TypeError("session_close must be a datetime.time")
+    if value.tzinfo is not None:
+        raise ValueError("session_close is an ET clock time, not a zoned datetime")
+    if (value.second, value.microsecond) != (0, 0):
+        raise ValueError("session_close must be a whole minute")
+    return time(value.hour, value.minute)
 
 
 def _as_date(value: object) -> date:

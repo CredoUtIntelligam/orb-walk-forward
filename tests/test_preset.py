@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 
 import pandas as pd
 
@@ -48,7 +48,11 @@ def test_fixture_preset_emits_the_single_long_at_1004() -> None:
         "entry_price": 5011.0,
         "window_minutes": 30,
         "trigger": "close_5m",
+        "early_close": False,
+        "session_close": "16:00",
     }
+    assert signal.early_close is False
+    assert signal.session_close == time(16, 0)
     assert date(2024, 1, 17) not in [item.session_date for item in signals]
     assert date(2024, 1, 18) not in [item.session_date for item in signals]
 
@@ -188,6 +192,9 @@ def test_early_close_buckets_cannot_extend_past_the_session_close() -> None:
     assert fired[0].entry_ts == pd.Timestamp("2023-07-03 13:14", tz=NY)
     assert fired[0].entry_price == 11.5
     assert fired[0].direction == "long"
+    assert fired[0].early_close is True
+    assert fired[0].session_close == time(13, 15)
+    assert fired[0].to_dict()["session_close"] == "13:15"
 
     past_1315 = _frame(
         [
@@ -208,6 +215,8 @@ def test_early_close_buckets_cannot_extend_past_the_session_close() -> None:
     at_noon = frozen_es_signals(halt_at_1300)
     assert len(at_noon) == 1
     assert at_noon[0].entry_ts == pd.Timestamp("2024-07-04 12:59", tz=NY)
+    assert at_noon[0].early_close is True
+    assert at_noon[0].session_close == time(13, 0)
 
     only_spec_bucket = _frame(
         [

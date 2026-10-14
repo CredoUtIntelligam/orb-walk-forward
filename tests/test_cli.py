@@ -34,6 +34,8 @@ EXPECTED = [
         "entry_price": 5011.0,
         "window_minutes": 15,
         "trigger": "close",
+        "early_close": False,
+        "session_close": "16:00",
     },
     {
         "session_date": "2024-01-17",
@@ -44,6 +46,8 @@ EXPECTED = [
         "entry_price": 5047.0,
         "window_minutes": 15,
         "trigger": "close",
+        "early_close": False,
+        "session_close": "16:00",
     },
 ]
 
@@ -137,6 +141,8 @@ def test_window_selects_the_opening_range(
             "entry_price": 11.0,
             "window_minutes": 15,
             "trigger": "close",
+            "early_close": False,
+            "session_close": "16:00",
         }
     ]
 
@@ -168,6 +174,20 @@ def test_out_writes_csv_and_json(capsys: pytest.CaptureFixture[str], tmp_path: P
     assert [row["entry_ts"] for row in rows] == [
         "2024-01-16T10:00:00-05:00",
         "2024-01-17T10:00:00-05:00",
+    ]
+    assert [row["early_close"] for row in rows] == ["False", "False"]
+    assert [row["session_close"] for row in rows] == ["16:00", "16:00"]
+    assert list(rows[0]) == [
+        "session_date",
+        "direction",
+        "or_high",
+        "or_low",
+        "entry_ts",
+        "entry_price",
+        "window_minutes",
+        "trigger",
+        "early_close",
+        "session_close",
     ]
     assert "2024-01-18" not in csv_path.read_text()
 
@@ -211,6 +231,10 @@ def test_early_close_sessions_are_included(
     assert [row["entry_price"] for row in signals] == [11.0, 11.0]
     assert signals[0]["entry_ts"] == "2024-07-03T09:45:00-04:00"
     assert signals[1]["entry_ts"] == "2024-07-05T09:45:00-04:00"
+    assert signals[0]["early_close"] is True
+    assert signals[1]["early_close"] is False
+    assert signals[0]["session_close"] == "13:00"
+    assert signals[1]["session_close"] == "16:00"
 
     with pytest.raises(SystemExit) as exc:
         main(["--data", str(path), "--include-early-close"])
@@ -238,6 +262,8 @@ def test_frozen_es_preset_on_the_fixture_is_one_long_at_1004(
             "entry_price": 5011.0,
             "window_minutes": 30,
             "trigger": "close_5m",
+            "early_close": False,
+            "session_close": "16:00",
         }
     ]
 

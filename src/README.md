@@ -17,7 +17,8 @@ Current modules:
   The default trigger is a close strictly beyond the range; `high_low`
   uses a high or low that trades strictly through the level.
   Rows flagged `early_close` are kept when that column is present.
-  The flag is metadata. Entries stop at the session close
+  The flag is metadata and is copied onto each signal with `session_close`.
+  Entries stop at the session close
 - `orb/preset.py` — `frozen_es_signals`, the frozen ES ORB signal
   (30-minute box, 5-minute close, long only). Not the research default.
   The last bucket is the earlier of 13:50-13:55 and the session close

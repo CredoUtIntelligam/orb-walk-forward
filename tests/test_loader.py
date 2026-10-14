@@ -520,27 +520,29 @@ def test_early_close_sessions_are_flagged_and_kept_for_signals(
     assert list(inspect.signature(signal_bars).parameters) == ["bars"]
 
     rth = load_ohlcv(path, rth_only=True)
-    assert _clocks(_on(rth, "2024-07-03")) == [(9, 30), (12, 59)]
+    # 13:00 prints on both short days, so the window is 13:15. 15:00 is past it.
+    assert _clocks(_on(rth, "2024-07-03")) == [(9, 30), (12, 59), (13, 0)]
     assert bool(_on(rth, "2024-07-03")["early_close"].all())
     assert bool(_on(rth, "2024-07-04")["early_close"].all())
-    assert _clocks(_on(rth, "2024-07-04")) == [(9, 30)]
+    assert _clocks(_on(rth, "2024-07-04")) == [(9, 30), (13, 0)]
     assert _clocks(_on(rth, "2024-07-05")) == [(9, 30), (15, 59)]
     assert not bool(_on(rth, "2024-07-05")["early_close"].any())
 
     signals = signal_bars(rth)
-    assert _clocks(_on(signals, "2024-07-03")) == [(9, 30), (12, 59)]
+    assert _clocks(_on(signals, "2024-07-03")) == [(9, 30), (12, 59), (13, 0)]
     assert bool(_on(signals, "2024-07-03")["early_close"].all())
-    assert _clocks(_on(signals, "2024-07-04")) == [(9, 30)]
+    assert _clocks(_on(signals, "2024-07-04")) == [(9, 30), (13, 0)]
     assert bool(_on(signals, "2024-07-04")["early_close"].all())
     assert _clocks(_on(signals, "2024-07-05")) == [(9, 30), (15, 59)]
     assert not bool(_on(signals, "2024-07-05")["early_close"].any())
 
     gaps = rth_gap_report(rth)
     july3 = gaps[gaps["session"] == "2024-07-03"]
-    thirteen = pd.Timestamp("2024-07-03 13:00", tz="America/New_York")
+    fifteen = pd.Timestamp("2024-07-03 13:15", tz="America/New_York")
     assert (july3["start"] == pd.Timestamp("2024-07-03 09:31", tz="America/New_York")).any()
-    assert not bool((july3["start"] >= thirteen).any())
-    assert july3["end"].max() <= thirteen
+    assert (july3["start"] == pd.Timestamp("2024-07-03 13:01", tz="America/New_York")).any()
+    assert not bool((july3["start"] >= fifteen).any())
+    assert july3["end"].max() == fifteen
 
 
 def test_missing_file_raises(tmp_path: Path) -> None:
@@ -780,16 +782,77 @@ def test_holiday_short_sessions_are_early_closes_and_keep_gap_reports(
     gaps = rth_gap_report(rth)
     for day in days:
         session = _on(rth, day)
-        assert _clocks(session) == [(9, 30)]
+        # The 13:00 print moves the calendar halt to 13:15.
+        assert _clocks(session) == [(9, 30), (13, 0)]
         assert bool(session["early_close"].all())
-        halt = pd.Timestamp(f"{day} 13:00", tz="America/New_York")
+        halt = pd.Timestamp(f"{day} 13:15", tz="America/New_York")
         reported = gaps[gaps["session"] == day]
         assert not reported.empty
         assert reported["end"].max() == halt
         assert not bool((reported["start"] >= halt).any())
         kept_day = _on(kept, day)
-        assert _clocks(kept_day) == [(9, 30)]
+        assert _clocks(kept_day) == [(9, 30), (13, 0)]
         assert bool(kept_day["early_close"].all())
+
+
+def test_rth_and_gaps_use_1315_when_the_early_tape_prints_past_1300(
+    tmp_path: Path,
+) -> None:
+    """2022-11-25 is a calendar 13:00 halt. A 13:14 bar makes the close 13:15.
+
+    ``rth_only`` keeps 13:00 and 13:14 and drops 13:15. The gap report
+    measures through 13:14, including the hole between those two prints.
+    A session with no bar in ``[13:00, 13:15)`` still ends at 13:00, and a
+    13:54 print does not extend it.
+    """
+    path = tmp_path / "tape-1315.csv"
+    rows = [
+        _bar(_utc("2022-11-25 09:30"), close=1),
+        _bar(_utc("2022-11-25 12:59"), close=2),
+        _bar(_utc("2022-11-25 13:00"), close=3),
+        _bar(_utc("2022-11-25 13:14"), close=4),
+        _bar(_utc("2022-11-25 13:15"), close=5),
+        _bar(_utc("2024-07-04 09:30"), close=6),
+        _bar(_utc("2024-07-04 12:59"), close=7),
+        _bar(_utc("2024-11-29 09:30"), close=8),
+        _bar(_utc("2024-11-29 12:59"), close=9),
+        _bar(_utc("2024-11-29 13:54"), close=10),
+        _bar(_utc("2023-11-24 09:30"), close=11),
+    ]
+    _write_csv(path, rows)
+
+    rth = load_ohlcv(path, rth_only=True)
+    assert _clocks(_on(rth, "2022-11-25")) == [(9, 30), (12, 59), (13, 0), (13, 14)]
+    assert bool(_on(rth, "2022-11-25")["early_close"].all())
+    assert _clocks(_on(rth, "2024-07-04")) == [(9, 30), (12, 59)]
+    assert _clocks(_on(rth, "2024-11-29")) == [(9, 30), (12, 59)]
+
+    gaps = rth_gap_report(rth)
+    black_friday = gaps[gaps["session"] == "2022-11-25"]
+    hole = black_friday[black_friday["start"] == pd.Timestamp("2022-11-25 13:01", tz="America/New_York")]
+    assert len(hole) == 1
+    assert hole.iloc[0]["end"] == pd.Timestamp("2022-11-25 13:14", tz="America/New_York")
+    assert int(hole.iloc[0]["missing_minutes"]) == 13
+    close_1315 = pd.Timestamp("2022-11-25 13:15", tz="America/New_York")
+    assert black_friday["end"].max() <= close_1315
+    assert not bool((black_friday["start"] >= close_1315).any())
+    late = _on(rth, "2022-11-25")
+    at_1314 = (late.index.hour == 13) & (late.index.minute == 14)
+    assert int(late.loc[at_1314, "rth_gap_before"].iloc[0]) == 13
+
+    july4 = gaps[gaps["session"] == "2024-07-04"]
+    # 12:59 is inside the window, so the hole stops there and nothing from 13:00 is missing.
+    assert july4["end"].max() == pd.Timestamp("2024-07-04 12:59", tz="America/New_York")
+    assert not bool((july4["start"] >= pd.Timestamp("2024-07-04 13:00", tz="America/New_York")).any())
+    day_after = gaps[gaps["session"] == "2024-11-29"]
+    assert day_after["end"].max() == pd.Timestamp("2024-11-29 12:59", tz="America/New_York")
+    assert not bool((day_after["start"] >= pd.Timestamp("2024-11-29 13:00", tz="America/New_York")).any())
+    calendar_halt = gaps[gaps["session"] == "2023-11-24"]
+    assert _clocks(_on(rth, "2023-11-24")) == [(9, 30)]
+    assert calendar_halt["end"].max() == pd.Timestamp("2023-11-24 13:00", tz="America/New_York")
+    assert not bool(
+        (calendar_halt["start"] >= pd.Timestamp("2023-11-24 13:00", tz="America/New_York")).any()
+    )
 
 
 @pytest.mark.parametrize("column", ["open", "high", "low", "close"])

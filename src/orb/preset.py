@@ -29,7 +29,7 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
-from orb.breakout import LONG, TRIGGER_CLOSE_5M, Signal
+from orb.breakout import LONG, TRIGGER_CLOSE_5M, Signal, _session_facts
 from orb.loader import NY_TZ, entry_cutoff_minute, signal_bars
 
 FROZEN_ES_PRESET = "frozen-es"
@@ -192,6 +192,7 @@ def _signal_for_day(day: pd.DataFrame, session_date: date) -> Signal | None:
             continue
         stamp, price = found
         if price > or_high:
+            early_close, session_close = _session_facts(day, session_date)
             return Signal(
                 session_date=session_date,
                 direction=LONG,
@@ -201,6 +202,8 @@ def _signal_for_day(day: pd.DataFrame, session_date: date) -> Signal | None:
                 entry_price=price,
                 window_minutes=FROZEN_ES_WINDOW_MINUTES,
                 trigger=TRIGGER_CLOSE_5M,
+                early_close=early_close,
+                session_close=session_close,
             )
     return None
 

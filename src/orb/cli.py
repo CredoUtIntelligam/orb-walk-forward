@@ -48,6 +48,8 @@ COLUMNS = (
     "entry_price",
     "window_minutes",
     "trigger",
+    "early_close",
+    "session_close",
 )
 
 _FORMATS = ("table", "json")

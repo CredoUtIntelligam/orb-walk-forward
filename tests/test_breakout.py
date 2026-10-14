@@ -21,6 +21,7 @@ from orb import (
     signal_bars,
 )
 from orb.breakout import LONG, SHORT, TRIGGER_CLOSE, TRIGGER_HIGH_LOW
+from orb.loader import RTH_CLOSE_MINUTES, calendar_rth_close_minute
 
 NY = "America/New_York"
 RTH_OPEN = 9 * 60 + 30
@@ -111,7 +112,15 @@ def _signal(
     or_low: float = 6.0,
     window_minutes: int = 15,
     trigger: str = TRIGGER_CLOSE,
+    early_close: bool | None = None,
+    session_close: time | None = None,
 ) -> Signal:
+    calendar = calendar_rth_close_minute(day)
+    if early_close is None:
+        early_close = calendar is not None and calendar < RTH_CLOSE_MINUTES
+    if session_close is None:
+        close = RTH_CLOSE_MINUTES if calendar is None or calendar > RTH_CLOSE_MINUTES else calendar
+        session_close = time(close // 60, close % 60)
     return Signal(
         session_date=day,
         direction=direction,
@@ -121,6 +130,8 @@ def _signal(
         entry_price=entry_price,
         window_minutes=window_minutes,
         trigger=trigger,
+        early_close=early_close,
+        session_close=session_close,
     )
 
 
@@ -135,6 +146,8 @@ def test_signal_fields_are_frozen_and_one_per_day() -> None:
         "entry_price",
         "window_minutes",
         "trigger",
+        "early_close",
+        "session_close",
     ]
     bars = pd.concat(
         [
@@ -175,12 +188,16 @@ def test_signal_fields_are_frozen_and_one_per_day() -> None:
     assert signal.entry_price == 12.0
     assert signal.window_minutes == 15
     assert signal.trigger == TRIGGER_CLOSE
+    assert signal.early_close is False
+    assert signal.session_close == time(16, 0)
     payload = signal.to_dict()
     assert json.loads(json.dumps(payload)) == payload
     assert payload["session_date"] == "2024-01-16"
     assert payload["entry_ts"] == "2024-01-16T09:45:00-05:00"
     assert payload["window_minutes"] == 15
     assert payload["trigger"] == "close"
+    assert payload["early_close"] is False
+    assert payload["session_close"] == "16:00"
     with pytest.raises(FrozenInstanceError):
         signal.entry_price = 0.0  # type: ignore[misc]
 
@@ -473,6 +490,8 @@ def test_fixture_emits_long_short_and_no_breakout() -> None:
             entry_price=spec["entry_price"],
             window_minutes=15,
             trigger=TRIGGER_CLOSE,
+            early_close=False,
+            session_close=time(16, 0),
         )
         for day, spec in FIXTURE_SIGNALS.items()
     ]
@@ -611,9 +630,10 @@ def test_breakout_keeps_rows_flagged_early_close() -> None:
 
     signals = breakout_signals(bars, ranges)
     assert signals == [
-        _signal(date(2024, 1, 16), LONG, "09:45", 11.0),
-        _signal(date(2024, 1, 17), LONG, "09:45", 11.0),
+        _signal(date(2024, 1, 16), LONG, "09:45", 11.0, early_close=True),
+        _signal(date(2024, 1, 17), LONG, "09:45", 11.0, early_close=False),
     ]
+    assert signals[0].session_close == time(16, 0)
     pd.testing.assert_frame_equal(bars, before)
     assert bool(bars.loc[bars.index.date == date(2024, 1, 16), "early_close"].all())
 
@@ -682,6 +702,42 @@ def test_early_close_entry_stops_at_the_session_halt() -> None:
 
     only_late = breakout_signals(pd.concat([before_halt, past_halt]), ranges)
     assert only_late == []
+    assert signaled[0].early_close is True
+    assert signaled[0].session_close == time(13, 0)
+
+
+def test_signal_records_the_1315_close_when_the_tape_prints_it() -> None:
+    """A 13:14 bar on a calendar 13:00 day records a 13:15 session close.
+
+    2022-11-25 is that halt. The 13:14 close can be the entry. A later
+    13:19 bar cannot, and a 13:54 bar on its own does not move the close
+    off 13:00.
+    """
+    ranges = _ranges([(date(2022, 11, 25), 10.0, 6.0, 15)])
+    opening = _session("2022-11-25", RTH_OPEN, 1, high=10.0, low=6.0, close=8.0)
+    at_1314 = _session("2022-11-25", 13 * 60 + 14, 1, high=12.0, low=11.0, close=11.5)
+    signaled = breakout_signals(pd.concat([opening, at_1314]), ranges)
+    assert signaled == [
+        _signal(
+            date(2022, 11, 25),
+            LONG,
+            "13:14",
+            11.5,
+            session_close=time(13, 15),
+        )
+    ]
+    assert signaled[0].early_close is True
+    assert signaled[0].to_dict()["session_close"] == "13:15"
+
+    past = _session("2022-11-25", 13 * 60 + 19, 1, high=14.0, low=13.0, close=13.5)
+    inside = _session("2022-11-25", 13 * 60 + 14, 1, high=9.0, low=7.0, close=8.0)
+    assert breakout_signals(pd.concat([opening, inside, past]), ranges) == []
+
+    at_1259 = _session("2022-11-25", 12 * 60 + 59, 1, high=12.0, low=11.0, close=11.5)
+    stray = _session("2022-11-25", 13 * 60 + 54, 1, high=20.0, low=19.0, close=19.5)
+    calendar_halt = breakout_signals(pd.concat([opening, at_1259, stray]), ranges)
+    assert calendar_halt == [_signal(date(2022, 11, 25), LONG, "12:59", 11.5)]
+    assert calendar_halt[0].session_close == time(13, 0)
 
 
 def test_signal_rejects_bad_direction_and_field_types() -> None:
@@ -701,6 +757,8 @@ def test_signal_rejects_bad_direction_and_field_types() -> None:
             entry_price=11.0,
             window_minutes=15,
             trigger=TRIGGER_CLOSE,
+            early_close=False,
+            session_close=time(16, 0),
         )
     with pytest.raises(TypeError, match="entry_price"):
         _signal(date(2024, 1, 16), LONG, "09:45", True)  # type: ignore[arg-type]
@@ -714,11 +772,17 @@ def test_signal_rejects_bad_direction_and_field_types() -> None:
             entry_price=11.0,
             window_minutes=15,
             trigger=TRIGGER_CLOSE,
+            early_close=False,
+            session_close=time(16, 0),
         )
     with pytest.raises(TypeError, match="window_minutes"):
         _signal(date(2024, 1, 16), LONG, "09:45", 11.0, window_minutes=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="close_5m"):
         _signal(date(2024, 1, 16), LONG, "09:45", 11.0, trigger="wick")
+    with pytest.raises(TypeError, match="early_close"):
+        _signal(date(2024, 1, 16), LONG, "09:45", 11.0, early_close=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="session_close"):
+        _signal(date(2024, 1, 16), LONG, "09:45", 11.0, session_close="16:00")  # type: ignore[arg-type]
 
 
 def _breakout_day(day: str) -> pd.DataFrame:

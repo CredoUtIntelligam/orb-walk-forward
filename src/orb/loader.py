@@ -9,7 +9,9 @@ intersected with the CME equity calendar (``CME_Equity``). Weekends and full
 holidays are not sessions. Holiday short sessions, when futures still trade
 a shortened day (July 4, Thanksgiving, MLK Day, and any other CME equity halt
 before 16:00 ET), are early closes: the window ends at the halt and the
-session is flagged ``early_close``. That flag is metadata.
+session is flagged ``early_close``. A calendar halt of 13:00 whose tape
+still prints a minute in ``[13:00, 13:15)`` closes at 13:15, the same
+rule as the signal cutoff. That flag is metadata.
 :func:`signal_bars` keeps those sessions. They stay in the loaded frame
 and in the RTH gap report.
 """
@@ -97,8 +99,10 @@ def load_ohlcv(
         Keep bars inside CME equity regular trading hours. On a full session
         that is ``[09:30, 16:00)`` America/New_York. Early-close sessions,
         including holiday short sessions such as July 4, Thanksgiving, and
-        MLK Day, end at the exchange halt. Weekends and full holidays are not
-        regular hours.
+        MLK Day, end at the exchange halt. When that halt is 13:00 and the
+        file still contains a minute-aligned bar in ``[13:00, 13:15)``, the
+        window closes at 13:15. The gap report uses that same close.
+        Weekends and full holidays are not regular hours.
     allow_synthetic:
         Must be ``True`` to load bars whose normalized content matches the
         bundled synthetic fixture. The check is a checksum of those rows, not
@@ -483,10 +487,13 @@ def _session_rth(
     the window map. A date is early-close when CME equity halts before
     16:00 ET. That includes holiday short sessions (July 4, Thanksgiving,
     MLK Day, and similar days that still trade a shortened futures session)
-    and halts at or before the 09:30 open.
+    and halts at or before the 09:30 open. A 13:00 halt is moved to 13:15
+    when ``index`` contains a minute-aligned bar in ``[13:00, 13:15)``,
+    matching :func:`entry_cutoff_minute`.
     """
     if len(index) == 0:
         return {}, set()
+    observed = _observed_minutes_by_date(index)
     start = pd.Timestamp(index.min()).date()
     end = pd.Timestamp(index.max()).date()
     schedule = _cme_equity_calendar().schedule(start_date=start, end_date=end)
@@ -501,8 +508,27 @@ def _session_rth(
             early_dates.add(session_date)
         if close_ny <= open_rth:
             continue
-        windows[session_date] = (open_rth, min(close_ny, regular_close))
+        close_minute = entry_cutoff_minute(
+            session_date, observed.get(session_date, ())
+        )
+        windows[session_date] = (
+            open_rth,
+            _ny_at(session_date, time(close_minute // 60, close_minute % 60)),
+        )
     return windows, early_dates
+
+
+def _observed_minutes_by_date(index: pd.DatetimeIndex) -> dict:
+    """Minute-of-day values for minute-aligned stamps, grouped by session."""
+    aligned = (index.second == 0) & (index.microsecond == 0) & (index.nanosecond == 0)
+    if not bool(aligned.any()):
+        return {}
+    stamps = index[aligned]
+    minutes = stamps.hour * 60 + stamps.minute
+    grouped: dict = {}
+    for stamp, minute in zip(stamps, minutes, strict=True):
+        grouped.setdefault(stamp.date(), []).append(int(minute))
+    return grouped
 
 
 # The pinned CME_Equity calendar ends an afternoon early close at 13:00 ET.

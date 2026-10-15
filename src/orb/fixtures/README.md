@@ -41,8 +41,9 @@ The default breakout rule (close strictly beyond the range) and the
 10:00 ET bar as the signal on the first two sessions. The third session
 emits nothing. These rows are still not a backtest. None of these three
 sessions is an early close. Holiday short sessions are covered in
-`tests/test_loader.py` and `tests/test_breakout.py`: they are flagged
-`early_close` and `signal_bars` removes them before a signal is computed.
+`tests/test_loader.py` and `tests/test_breakout.py`: they stay flagged
+`early_close`, `signal_bars` keeps them, and a signal may still fire
+before the session halt.
 
 Daylight-saving conversion is covered in `tests/test_loader.py` with explicit
 UTC timestamps on both sides of the March and November transitions. These

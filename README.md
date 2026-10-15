@@ -7,7 +7,7 @@ This repo is designed to be driven by looping Grok Bots (orchestrator + speciali
 ## Goal
 Build a robust, reproducible walk-forward framework for ORB variants (range length, entry confirmation, filters, targets/stops, etc.) using Databento data where available. Results should support the existing Vega bot's ORB research.
 
-The code in this repo is landing one piece at a time. Piece 1 is the hardened sample-data loader. Piece 2 is the opening-range calculation. Piece 3 is the breakout signal. Callers feed `signal_bars(load_ohlcv(...))` into the range and signal functions so early-close sessions never produce a signal. A small CLI is the next piece. A walk-forward optimizer, position sizing, execution, and P&L are out of scope until that core exists.
+The code in this repo is landing one piece at a time. Piece 1 is the hardened sample-data loader. Piece 2 is the opening-range calculation. Piece 3 is the breakout signal. Piece 4 is a small CLI (`python -m orb` and `orb-signals`). The default CLI mode is a research scan and is not the frozen ES ORB spec. `--preset frozen-es` is that spec's signal rule. Early-close sessions never produce a signal. A walk-forward optimizer, position sizing, execution, and P&L stay out of scope.
 
 ## Package layout
 
@@ -15,14 +15,19 @@ The installable package is `orb`, in `src/orb/` (src layout). `src/__init__.py` 
 
 ```
 src/orb/__init__.py
+src/orb/__main__.py
+src/orb/cli.py
 src/orb/loader.py
 src/orb/opening_range.py
 src/orb/breakout.py
+src/orb/preset.py
 src/orb/fixtures/SYNTHETIC_TEST_DATA_mes_ohlcv-1m.csv
 src/orb/fixtures/README.md
 tests/test_loader.py
 tests/test_opening_range.py
 tests/test_breakout.py
+tests/test_cli.py
+tests/test_preset.py
 pyproject.toml
 ```
 
@@ -34,9 +39,9 @@ Python 3.10+. Runtime dependencies are pandas, numpy, pyarrow, tzdata, and pinne
 
 `ts_event` must be UTC: ISO-8601 text with an explicit `Z` or `+00:00` offset, or integer nanoseconds. Naive timestamps, non-UTC offsets, mixed offsets, and non-integer digit-like strings are rejected. The frame is indexed by timezone-aware `America/New_York` timestamps, so daylight saving time follows the IANA timezone. OHLC columns are floats and `volume` is int. Bars with a non-finite or non-positive price, `high < low`, an open or close outside `[low, high]`, or a negative volume are rejected. A repeated symbol and timestamp raises unless `drop_duplicates=True`.
 
-Pass `symbol` to keep one instrument. Pass `rth_only=True` to keep CME equity regular trading hours: `[09:30, 16:00)` ET on a full session, using the `CME_Equity` calendar for weekends, full holidays, and early closes. 16:00 is exclusive because these bars are stamped at the start of the minute; the last full-session bar starts at 15:59. An earlier exchange halt shortens that window. Missing minutes inside a session are reported (`rth_gap_before` and `rth_gap_report`) and are never filled.
+Pass `symbol` to keep one instrument. Pass `rth_only=True` to keep CME equity regular trading hours: `[09:30, 16:00)` ET on a full session, using the `CME_Equity` calendar for weekends, full holidays, and early closes. 16:00 is exclusive because these bars are stamped at the start of the minute; the last full-session bar starts at 15:59. An earlier exchange halt shortens that window. When the calendar halt is 13:00 and the file still has a minute in `[13:00, 13:15)`, the window and the gap report both close at 13:15. Missing minutes inside a session are reported (`rth_gap_before` and `rth_gap_report`) and are never filled.
 
-Holiday short sessions, when futures still trade a shortened day (July 4, Thanksgiving, MLK Day, and other CME equity halts before 16:00 ET), are early closes. They are flagged on `early_close`, stay in the loaded frame, and stay eligible for the gap report. `signal_bars` always removes them. That exclusion is fixed; there is no switch to include early-close sessions in signals.
+Holiday short sessions, when futures still trade a shortened day (July 4, Thanksgiving, MLK Day, and other CME equity halts before 16:00 ET), are early closes. They are flagged on `early_close`, stay in the loaded frame, and stay eligible for the gap report and for signals. `signal_bars` keeps them. The flag is metadata; there is no switch that drops those sessions. An entry scan stops at the session close, which is the halt on a shortened day. When the CME calendar halt is 13:00 and the tape still prints a bar in `[13:00, 13:15)`, that close is 13:15 so the 13:14 bar can complete an entry.
 
 ```python
 from orb import (
@@ -68,21 +73,51 @@ The window starts at 09:30 ET. `window_minutes` defaults to 15 and can be 5, 30,
 
 A session is kept only when every minute in the window is present exactly once. A missing minute, a duplicate stamp, or a sub-minute timestamp inside the window drops that day. Bars outside the window, including 09:29 and the 16:00 bar, are ignored. Pass one symbol; a frame that still contains more than one symbol is rejected so two instruments are not blended into one range.
 
-Build ranges from `signal_bars(load_ohlcv(...))` when they will feed breakout signals. `opening_ranges` itself does not drop `early_close` rows, so an unfiltered frame can still produce a range for a holiday short session. Those ranges should not be paired with the unfiltered bars if the goal is a signal.
+Build ranges from `signal_bars(load_ohlcv(...))` when they will feed breakout signals, so the range table and the scan cover the same sessions. `opening_ranges` does not drop `early_close` rows. A holiday short session with a complete window still produces a range.
 
 ## Breakout signals
 
-`breakout_signals` takes those bars and that range table and returns a `list[Signal]`. Each `Signal` has `session_date`, `direction` (`"long"` or `"short"`), `or_high`, `or_low`, `entry_ts` (start of the triggering minute, America/New_York), and `entry_price`. At most one signal is returned per session date.
+`breakout_signals` takes those bars and that range table and returns a `list[Signal]`. Each `Signal` has `session_date`, `direction` (`"long"` or `"short"`), `or_high`, `or_low`, `entry_ts` (start of the triggering minute, America/New_York), `entry_price`, `window_minutes`, `trigger` (`"close"` or `"high_low"`), `early_close`, and `session_close` (the exclusive ET clock the scan used, such as `13:00`, `13:15`, or `16:00`). It also carries three clocks derived from the confirming bar: `bar_timestamp` (that bar's open), `confirmation_available_at` (one minute later, the 5-minute bucket end when the trigger is `close_5m`), and `earliest_actionable_at` (the next bar's open). `to_dict()` returns those fields with dates and timestamps as ISO-8601 strings and `session_close` as `HH:MM`. The record is frozen, and `__post_init__` checks the direction and the field types. At most one signal is returned per session date. This research function is not the frozen ES ORB spec.
 
-A session emits at most one signal: the first eligible bar that breaks the range. Later bars that day are ignored, including a break of the other side. A session with no break is omitted. Eligible bars are minute-aligned stamps in `[09:30 + window_minutes, 16:00)` ET. Bars inside the opening-range window, and bars at or after 16:00, do not signal. `window_minutes` comes from each range row.
+A session emits at most one signal: the first eligible bar that breaks the range. Later bars that day are ignored, including a break of the other side. A session with no break is omitted. Eligible bars are minute-aligned stamps in `[09:30 + window_minutes, session close)` ET. A full session closes at 16:00. An early close stops at the halt. Bars inside the opening-range window, and bars at or after the session close, do not signal. `window_minutes` comes from each range row.
 
-The default trigger is `"close"`. Long means the bar closes strictly above the opening-range high. Short means it closes strictly below the opening-range low. A wick through the level with the close back inside the range is not a breakout. `entry_price` is that close.
+The default trigger is close-only: `"close"`. Long means the bar closes strictly above the opening-range high. Short means it closes strictly below the opening-range low. A wick through the level with the close back inside the range is not a breakout. `entry_price` is that close. `high_low` is opt-in.
 
 `trigger="high_low"` fires when the bar's high trades strictly above the opening-range high, or its low trades strictly below the opening-range low. `entry_price` is the broken level (`or_high` or `or_low`), not the wick. A bar that trades through both levels is skipped, and scanning continues. Tagging a level exactly is not a break under either rule.
 
 `entry_price` is a reference on the signal, not a fill. The function does not size a position or compute P&L.
 
-Early-close sessions are excluded from signals. The recommended path is `load_ohlcv`, then `signal_bars`, then `opening_ranges`, then `breakout_signals`. When the bar frame still has an `early_close` column, `breakout_signals` drops rows where that flag is true before it scans. There is no parameter that puts those sessions back.
+Early-close sessions are included in signals. The recommended path is `load_ohlcv`, then `signal_bars`, then `opening_ranges`, then `breakout_signals`. When the bar frame still has an `early_close` column, `breakout_signals` keeps those rows and the flag. There is no parameter that drops them. The entry cutoff is that session's close.
+
+## CLI
+
+`python -m orb` and the `orb-signals` console script (from `[project.scripts]`, available after install) print the `list[Signal]`.
+
+The default mode is the research scan above. It is **not** the frozen ES ORB spec. `--window` is the opening-range length in minutes (default 15) and the session must contain every minute. `--trigger` is `close` or `high_low`. The default is close-only (`close`): the first 1-minute close strictly beyond the range. `high_low` is opt-in.
+
+`--preset frozen-es` is the spec signal, via `frozen_es_signals`. The box is `[09:30, 10:00)` America/New_York. A missing minute after 09:30 still produces a partial range (max high, min low of the bars present). A day is skipped only when the 09:30 bar is absent or the box is empty. The trigger is the first clock-aligned 5-minute close strictly above the box high, long only. Buckets run 10:00, 10:05, ..., 13:50. Each bucket is `[t, t+5)` and the close is the 1-minute bar at `t+4`, so the 10:00 bucket is stamped 10:04. The last eligible bucket ends at the earlier of 13:55 and the session close, so a shortened day cannot trigger a bucket that would extend past the halt. `--window` and `--trigger` do not apply under the preset. The preset does not place a stop, choose a target, or compute P&L.
+
+`--symbol` keeps one symbol, which is how a multi-contract Databento file is narrowed to one outright. The default input is the bundled synthetic fixture. `load_ohlcv` refuses that content unless `--allow-synthetic` is set, which is passed through as `allow_synthetic=True`. `--data` selects another local CSV or Parquet file. A renamed copy of the fixture is still refused without the flag, because the check is the loader's content checksum, not the file name.
+
+Early-close sessions stay included; the CLI always calls `signal_bars` and has no flag that drops them. Stdout is a readable table or JSON (`--format table` or `--format json`). `--out` writes a file instead of stdout, CSV or JSON by the extension.
+
+Loader failures, including a missing path and a refused synthetic file, print a one-line error and exit nonzero.
+
+```bash
+python -m orb --allow-synthetic
+python -m orb --allow-synthetic --preset frozen-es --format json
+orb-signals --data path/to/es.csv --symbol ESH6 --preset frozen-es --out signals.csv
+orb-signals --data path/to/ohlcv.csv --window 15 --trigger close --out signals.csv
+```
+
+```python
+from orb import frozen_es_signals, load_ohlcv, sample_fixture_path, signal_bars
+
+bars = signal_bars(
+    load_ohlcv(sample_fixture_path(), allow_synthetic=True, symbol="MES")
+)
+signals = frozen_es_signals(bars)
+```
 
 ## Tests
 
@@ -92,7 +127,7 @@ pytest
 ```
 
 ## Structure
-- `src/orb/` — Installable package. Sample-data loader, opening-range calculation, breakout signals, and synthetic fixture.
+- `src/orb/` — Installable package. Sample-data loader, opening-range calculation, breakout signals, the frozen ES signal preset, a small CLI, and synthetic fixture.
 - `notebooks/` — Exploratory analysis and result visualization.
 - `results/` — Walk-forward outputs (CSV, plots, summaries). Gitignored large files.
 - `templates/` — Bot descriptions, prompt examples, and orchestration notes.

@@ -148,6 +148,9 @@ def test_signal_fields_are_frozen_and_one_per_day() -> None:
         "trigger",
         "early_close",
         "session_close",
+        "bar_timestamp",
+        "confirmation_available_at",
+        "earliest_actionable_at",
     ]
     bars = pd.concat(
         [

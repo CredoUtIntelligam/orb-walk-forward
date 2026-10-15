@@ -50,6 +50,9 @@ def test_fixture_preset_emits_the_single_long_at_1004() -> None:
         "trigger": "close_5m",
         "early_close": False,
         "session_close": "16:00",
+        "bar_timestamp": "2024-01-16T10:04:00-05:00",
+        "confirmation_available_at": "2024-01-16T10:05:00-05:00",
+        "earliest_actionable_at": "2024-01-16T10:05:00-05:00",
     }
     assert signal.early_close is False
     assert signal.session_close == time(16, 0)

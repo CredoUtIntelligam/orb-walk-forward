@@ -36,6 +36,9 @@ EXPECTED = [
         "trigger": "close",
         "early_close": False,
         "session_close": "16:00",
+        "bar_timestamp": "2024-01-16T10:00:00-05:00",
+        "confirmation_available_at": "2024-01-16T10:01:00-05:00",
+        "earliest_actionable_at": "2024-01-16T10:01:00-05:00",
     },
     {
         "session_date": "2024-01-17",
@@ -48,6 +51,9 @@ EXPECTED = [
         "trigger": "close",
         "early_close": False,
         "session_close": "16:00",
+        "bar_timestamp": "2024-01-17T10:00:00-05:00",
+        "confirmation_available_at": "2024-01-17T10:01:00-05:00",
+        "earliest_actionable_at": "2024-01-17T10:01:00-05:00",
     },
 ]
 
@@ -143,6 +149,9 @@ def test_window_selects_the_opening_range(
             "trigger": "close",
             "early_close": False,
             "session_close": "16:00",
+            "bar_timestamp": "2024-01-16T09:45:00-05:00",
+            "confirmation_available_at": "2024-01-16T09:46:00-05:00",
+            "earliest_actionable_at": "2024-01-16T09:46:00-05:00",
         }
     ]
 
@@ -188,6 +197,9 @@ def test_out_writes_csv_and_json(capsys: pytest.CaptureFixture[str], tmp_path: P
         "trigger",
         "early_close",
         "session_close",
+        "bar_timestamp",
+        "confirmation_available_at",
+        "earliest_actionable_at",
     ]
     assert "2024-01-18" not in csv_path.read_text()
 
@@ -264,6 +276,9 @@ def test_frozen_es_preset_on_the_fixture_is_one_long_at_1004(
             "trigger": "close_5m",
             "early_close": False,
             "session_close": "16:00",
+            "bar_timestamp": "2024-01-16T10:04:00-05:00",
+            "confirmation_available_at": "2024-01-16T10:05:00-05:00",
+            "earliest_actionable_at": "2024-01-16T10:05:00-05:00",
         }
     ]
 

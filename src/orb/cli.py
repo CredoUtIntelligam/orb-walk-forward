@@ -50,6 +50,9 @@ COLUMNS = (
     "trigger",
     "early_close",
     "session_close",
+    "bar_timestamp",
+    "confirmation_available_at",
+    "earliest_actionable_at",
 )
 
 _FORMATS = ("table", "json")

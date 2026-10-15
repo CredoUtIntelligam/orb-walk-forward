@@ -120,6 +120,15 @@ class Signal:
     exclusive America/New_York clock the scan used (``13:00``, ``13:15``,
     or ``16:00`` on the sessions this package distinguishes).
 
+    Three clocks are derived from ``entry_ts`` and are not a second
+    decision. ``bar_timestamp`` is the open of the confirming 1-minute
+    bar. ``confirmation_available_at`` is when that bar's close is known,
+    one minute later. For ``close_5m`` the confirming bar is the last
+    minute of the bucket, so that instant is the bucket end (the 10:04
+    bar confirms at 10:05). ``earliest_actionable_at`` is the open of the
+    next 1-minute bar, the same instant. They do not change which bar
+    fires, and two signals with the same decision fields stay equal.
+
     ``__post_init__`` checks those types and the direction. ``to_dict``
     returns JSON-safe values. The record stays frozen.
     """
@@ -134,6 +143,9 @@ class Signal:
     trigger: str
     early_close: bool
     session_close: time
+    bar_timestamp: pd.Timestamp | None = None
+    confirmation_available_at: pd.Timestamp | None = None
+    earliest_actionable_at: pd.Timestamp | None = None
 
     def __post_init__(self) -> None:
         session_date = _require_session_date(self.session_date)
@@ -156,13 +168,20 @@ class Signal:
         object.__setattr__(self, "trigger", trigger)
         object.__setattr__(self, "early_close", early_close)
         object.__setattr__(self, "session_close", session_close)
+        bar_timestamp, confirmation_available_at, earliest_actionable_at = (
+            _derived_timing(entry_ts)
+        )
+        object.__setattr__(self, "bar_timestamp", bar_timestamp)
+        object.__setattr__(self, "confirmation_available_at", confirmation_available_at)
+        object.__setattr__(self, "earliest_actionable_at", earliest_actionable_at)
 
     def to_dict(self) -> dict[str, object]:
         """Return JSON-safe fields.
 
         Dates and timestamps are ISO-8601 strings. Prices are ``float``
         and ``window_minutes`` is ``int``. ``early_close`` is a ``bool``.
-        ``session_close`` is ``HH:MM`` in America/New_York.
+        ``session_close`` is ``HH:MM`` in America/New_York. The three
+        timing clocks are ISO-8601 timestamps.
         """
         return {
             "session_date": self.session_date.isoformat(),
@@ -175,6 +194,9 @@ class Signal:
             "trigger": self.trigger,
             "early_close": self.early_close,
             "session_close": self.session_close.strftime("%H:%M"),
+            "bar_timestamp": self.bar_timestamp.isoformat(),
+            "confirmation_available_at": self.confirmation_available_at.isoformat(),
+            "earliest_actionable_at": self.earliest_actionable_at.isoformat(),
         }
 
 
@@ -567,6 +589,20 @@ def _require_signal_trigger(value: object) -> str:
     if not isinstance(value, str) or value not in SIGNAL_TRIGGERS:
         raise ValueError("trigger must be 'close', 'high_low', or 'close_5m'")
     return value
+
+
+def _derived_timing(
+    entry_ts: pd.Timestamp,
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    """Open of the confirming bar, when its close is known, and the next open.
+
+    The confirming bar is the 1-minute bar stamped ``entry_ts``. Its close
+    is known one minute later. For a clock-aligned 5-minute bucket that
+    bar is minute ``t+4``, so the later instant is the bucket end. The
+    next bar opens at that same instant.
+    """
+    available = entry_ts + pd.Timedelta(minutes=1)
+    return entry_ts, available, available
 
 
 def _require_early_close(value: object) -> bool:

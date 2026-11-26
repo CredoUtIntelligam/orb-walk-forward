@@ -2,8 +2,11 @@
 
 Tables (append-only): ``bars``, ``signals``, ``orders``, ``fills``,
 ``heartbeats``, and ``events``. Every row carries ``run_id`` plus the event
-timestamp and ``logged_at``. ``events.kind`` is ``config``, ``gap``, or
-``shutdown``. Gaps are not a separate feed; they are events.
+timestamp and ``logged_at``. ``events.kind`` is ``config``, ``gap``,
+``bracket_rebuild``, ``cash_close``, or ``shutdown``. A gap is an event, not
+a filled bar. ``bracket_rebuild`` stores the intended stop and target from
+the signal price and the levels rebuilt from the entry fill. Size is not
+trimmed.
 
 ``log_config`` writes the parameter JSON, the git SHA when ``git`` can see
 one, and the seed. Keys whose names contain ``key``, ``secret``, ``token``,
@@ -24,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .ingest import CHICAGO, Bar
-from .position import Fill, Order
+from .position import Fill, LevelUpdate, Order
 from .signal import Signal
 
 _SCHEMA = """
@@ -193,6 +196,25 @@ class RunLogger:
 
     def heartbeat(self, ts: datetime, bar_count: int) -> None:
         self._insert("heartbeats", {"ts": _iso(ts), "bar_count": bar_count})
+
+    def log_level_update(self, update: LevelUpdate) -> None:
+        detail = json.dumps(
+            {
+                "fill_price": update.fill_price,
+                "intended_distance": update.intended_distance,
+                "intended_qty": update.intended_qty,
+                "intended_stop": update.intended_stop,
+                "intended_target": update.intended_target,
+                "rebuilt_distance": update.rebuilt_distance,
+                "rebuilt_stop": update.rebuilt_stop,
+                "rebuilt_target": update.rebuilt_target,
+                "risk_qty_at_fill": update.risk_qty_at_fill,
+                "side": update.side,
+                "size_trimmed": update.size_trimmed,
+            },
+            sort_keys=True,
+        )
+        self.event(update.ts, "bracket_rebuild", detail)
 
     def log_gap(self, ts: datetime, start: datetime, end: datetime) -> None:
         detail = json.dumps({"from": start.isoformat(), "to": end.isoformat()})

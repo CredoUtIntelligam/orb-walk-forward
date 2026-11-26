@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
 import signal
@@ -255,12 +256,80 @@ def test_fixed_stop_and_short_bracket() -> None:
     assert short_orders[2].price == 78
     assert short_orders[0].intended_qty == 10
     assert short_broker.on_bar(bar_at(8, 46, 89, 90, 88, 89)) == []
-    short_fills = short_broker.on_bar(bar_at(8, 47, 88, 89, 77, 80))
+    # Fill at 88 rebuilds the target to 76 (stop stays at the OR high).
+    short_fills = short_broker.on_bar(bar_at(8, 47, 88, 89, 76, 80))
     assert [fill.kind for fill in short_fills] == ["entry", "target"]
-    assert short_fills[1].price == 78
+    assert short_fills[1].price == 76
     assert short_broker.position_qty() == 0
+    short_update = short_broker.level_updates[-1]
+    assert short_update.intended_target == 78
+    assert short_update.rebuilt_target == 76
+    assert short_update.intended_qty == short_update.risk_qty_at_fill == 10
+    assert short_update.size_trimmed is False
     with pytest.raises(ValueError):
         PositionParams(1, 0.01, 5, stop_mode="trail")
+
+
+def test_rebuilds_bracket_from_fill_and_does_not_trim_size() -> None:
+    broker = SimBroker()
+    signal = long_signal()
+    _entry, stop, target = broker.submit_bracket(signal, PAPER)
+    assert stop.price == 90 and target.price == 114
+    fills = broker.on_bar(bar_at(8, 47, 104, 105, 103, 104))
+    assert [fill.kind for fill in fills] == ["entry"]
+    assert fills[0].price == 104 and fills[0].qty == 10
+    update = broker.level_updates[-1]
+    assert update.intended_stop == 90 and update.intended_target == 114
+    assert update.rebuilt_stop == 90 and update.rebuilt_target == 118
+    assert update.intended_distance == 12 and update.rebuilt_distance == 14
+    assert update.intended_qty == 10
+    assert update.risk_qty_at_fill == 8
+    assert update.size_trimmed is False
+    assert broker.brackets[0].entry.filled_qty == 10
+    assert stop.price == 90 and target.price == 118
+    # The pre-fill target is no longer live.
+    assert broker.on_bar(bar_at(8, 48, 104, 114, 103, 110)) == []
+    assert broker.position_qty() == 10
+    hit = broker.on_bar(bar_at(8, 49, 110, 118, 109, 115))
+    assert [fill.kind for fill in hit] == ["target"]
+    assert hit[0].price == 118
+
+    fixed = SimBroker()
+    fixed_orders = fixed.submit_bracket(
+        long_signal(),
+        PositionParams(100_000, 0.006, 5, stop_mode="fixed", stop_points=4, target_r=1),
+    )
+    fixed.on_bar(bar_at(8, 47, 103, 104, 102, 103))
+    fixed_update = fixed.level_updates[-1]
+    assert fixed_update.intended_stop == 98 and fixed_update.intended_target == 106
+    assert fixed_update.rebuilt_stop == 99 and fixed_update.rebuilt_target == 107
+    assert fixed_update.intended_qty == fixed_update.risk_qty_at_fill == 30
+    assert fixed_update.size_trimmed is False
+    assert fixed_orders[0].filled_qty == 30
+
+
+def test_rebuild_levels_are_logged(tmp_path: Path) -> None:
+    bars = opening_range() + [
+        bar_at(8, 45, 100, 104, 99, 103),
+        bar_at(8, 46, 103, 104, 100, 102),
+        bar_at(8, 47, 104, 105, 103, 104),
+    ]
+    _broker, conn = run_bars(tmp_path, bars)
+    detail = conn.execute(
+        "select detail from events where kind='bracket_rebuild'"
+    ).fetchone()[0]
+    payload = json.loads(detail)
+    assert payload["intended_stop"] == 90
+    assert payload["intended_target"] == 114
+    assert payload["rebuilt_stop"] == 90
+    assert payload["rebuilt_target"] == 118
+    assert payload["intended_qty"] == 10
+    assert payload["risk_qty_at_fill"] == 8
+    assert payload["size_trimmed"] is False
+    target_prices = [
+        row[0] for row in conn.execute("select price from orders where kind='target'")
+    ]
+    assert 114.0 in target_prices and 118.0 in target_prices
 
 
 def test_flatten_all_cancels_pending_and_closes_open() -> None:
@@ -318,7 +387,7 @@ def test_shutdown_flattens_and_logger_writes_every_row(tmp_path: Path) -> None:
     assert by_kind["flatten"]["status"] == "filled"
     assert conn.execute("select count(*) from heartbeats").fetchone()[0] == 18
     kinds = {row["kind"] for row in conn.execute("select kind from events")}
-    assert kinds == {"config", "shutdown"}
+    assert kinds == {"config", "shutdown", "bracket_rebuild"}
     config = conn.execute("select detail from events where kind='config'").fetchone()[0]
     assert '"seed": 7' in config
     assert "api_key" not in config

@@ -112,9 +112,14 @@ def run_loop(
                 run_log.log_bar(fresh)
                 if status != "released":
                     continue
+                seen_updates = len(broker.level_updates)
                 for fill in broker.on_bar(fresh):
                     run_log.log_fill(fill)
                     run_log.log_order(broker.order(fill.order_id))
+                for update in broker.level_updates[seen_updates:]:
+                    run_log.log_level_update(update)
+                    run_log.log_order(broker.order(update.stop_order_id))
+                    run_log.log_order(broker.order(update.target_order_id))
                 signal = tracker.on_bar(fresh)
                 if signal is not None:
                     _LOG.info("signal %s %s", signal.side, signal.ts.isoformat())

@@ -12,11 +12,17 @@ Stop and target
 ---------------
 * ``stop_mode="or_opposite"`` (default): long stop at the OR low, short stop
   at the OR high. Distance is ``abs(signal_price - stop)``.
-* ``stop_mode="fixed"``: stop is ``stop_points`` away from the signal price.
+* ``stop_mode="fixed"``: stop is ``stop_points`` away from the anchor price.
   ``stop_points`` must be positive or the bracket is skipped.
-* Target is ``target_r`` R away from the signal price (default 1R), using
-  that same distance. Prices are fixed at submission; the sim does not
-  recompute them from the fill.
+* Target is ``target_r`` R away from the same anchor (default 1R).
+* At submission the anchor is the signal price. Those prices are the
+  intended stop and target. When the entry fills, the anchor becomes the
+  fill price and the stop and target are rebuilt with the same parameters.
+  The size is computed once, at submission. The fill recomputes the size
+  the rebuilt distance would allow and records it. The filled quantity is
+  not trimmed when that allowance is smaller.
+* A long bracket and a short bracket in the same session are independent.
+  Both may be open together. Neither side cancels or suppresses the other.
 
 :class:`SimBroker` fill rules
 -----------------------------
@@ -108,9 +114,37 @@ class Fill:
     kind: str
 
 
+@dataclass(frozen=True)
+class LevelUpdate:
+    """Intended levels from the signal, and the levels rebuilt from the fill.
+
+    ``size_trimmed`` is always false. The filled quantity stays at
+    ``intended_qty`` even when ``risk_qty_at_fill`` is smaller.
+    """
+
+    ts: datetime
+    side: str
+    fill_price: float
+    intended_stop: float
+    intended_target: float
+    rebuilt_stop: float
+    rebuilt_target: float
+    intended_distance: float
+    rebuilt_distance: float
+    intended_qty: int
+    risk_qty_at_fill: int
+    size_trimmed: bool
+    stop_order_id: int
+    target_order_id: int
+
+
 @dataclass
 class Bracket:
-    """Entry plus protective stop and target for one signal."""
+    """Entry plus protective stop and target for one signal.
+
+    A session may hold one long bracket and one short bracket at the same
+    time. Submitting one side does not touch the other.
+    """
 
     side: str
     intended_qty: int
@@ -119,6 +153,14 @@ class Bracket:
     target: Order
     submitted_ts: datetime
     state: str
+    params: PositionParams
+    or_high: float
+    or_low: float
+    intended_stop: float
+    intended_target: float
+    intended_distance: float
+    rebuilt_stop: float | None = None
+    rebuilt_target: float | None = None
 
 
 class Broker(Protocol):
@@ -139,6 +181,7 @@ class SimBroker:
 
     def __init__(self) -> None:
         self.brackets: list[Bracket] = []
+        self.level_updates: list[LevelUpdate] = []
         self._orders: dict[int, Order] = {}
         self._ids = itertools.count(1)
         self.last_ts: datetime | None = None
@@ -161,24 +204,36 @@ class SimBroker:
         return net
 
     def submit_bracket(self, signal: Signal, params: PositionParams) -> list[Order]:
-        stop_px = _stop_price(signal, params)
-        if stop_px is None:
+        levels = _levels(signal.side, signal.price, params, signal.or_high, signal.or_low)
+        if levels is None:
             return []
-        distance = abs(signal.price - stop_px)
+        stop_px, target_px, distance = levels
         qty = size_contracts(params.equity, params.risk_pct, distance, params.point_value)
         if qty <= 0:
             return []
         if signal.side == "long":
-            target_px = signal.price + params.target_r * distance
             entry_side, exit_side = "buy", "sell"
         else:
-            target_px = signal.price - params.target_r * distance
             entry_side, exit_side = "sell", "buy"
         entry = self._make("entry", entry_side, qty, None, signal.ts)
         stop = self._make("stop", exit_side, qty, stop_px, signal.ts)
         target = self._make("target", exit_side, qty, target_px, signal.ts)
         self.brackets.append(
-            Bracket(signal.side, qty, entry, stop, target, signal.ts, "pending")
+            Bracket(
+                signal.side,
+                qty,
+                entry,
+                stop,
+                target,
+                signal.ts,
+                "pending",
+                params,
+                signal.or_high,
+                signal.or_low,
+                stop_px,
+                target_px,
+                distance,
+            )
         )
         return [entry, stop, target]
 
@@ -190,13 +245,18 @@ class SimBroker:
             if bracket.state == "pending" and bar.ts > bracket.submitted_ts:
                 fills.append(self._apply_fill(bracket.entry, bar.ts, bar.open, bracket.intended_qty))
                 bracket.state = "open"
+                self._rebuild_from_fill(bracket, bar)
             if bracket.state == "open":
                 exit_fill = self._exit_fill(bracket, bar)
                 if exit_fill is not None:
                     fills.append(exit_fill)
         return fills
 
-    def flatten_all(self, price: float | None = None) -> list[Fill]:
+    def flatten_all(self, price: float | None = None, ts: datetime | None = None) -> list[Fill]:
+        if ts is not None:
+            self.last_ts = ts
+        if price is not None:
+            self.last_price = price
         px = self.last_price if price is None else price
         ts = self.last_ts or datetime.now(CHICAGO)
         fills: list[Fill] = []
@@ -220,6 +280,51 @@ class SimBroker:
                     fills.append(self._apply_fill(order, ts, px, qty))
                 bracket.state = "closed"
         return fills
+
+    def _rebuild_from_fill(self, bracket: Bracket, bar: Bar) -> None:
+        """Move stop and target onto the fill. Do not change the quantity."""
+
+        levels = _levels(
+            bracket.side,
+            bar.open,
+            bracket.params,
+            bracket.or_high,
+            bracket.or_low,
+        )
+        assert levels is not None
+        stop_px, target_px, distance = levels
+        bracket.rebuilt_stop = stop_px
+        bracket.rebuilt_target = target_px
+        if bracket.stop.status == "working":
+            bracket.stop.price = stop_px
+            bracket.stop.ts = bar.ts
+        if bracket.target.status == "working":
+            bracket.target.price = target_px
+            bracket.target.ts = bar.ts
+        allowed = size_contracts(
+            bracket.params.equity,
+            bracket.params.risk_pct,
+            distance,
+            bracket.params.point_value,
+        )
+        self.level_updates.append(
+            LevelUpdate(
+                bar.ts,
+                bracket.side,
+                bar.open,
+                bracket.intended_stop,
+                bracket.intended_target,
+                stop_px,
+                target_px,
+                bracket.intended_distance,
+                distance,
+                bracket.intended_qty,
+                allowed,
+                False,
+                bracket.stop.order_id,
+                bracket.target.order_id,
+            )
+        )
 
     def _exit_fill(self, bracket: Bracket, bar: Bar) -> Fill | None:
         long = bracket.side == "long"
@@ -275,11 +380,31 @@ class SimBroker:
         return order
 
 
-def _stop_price(signal: Signal, params: PositionParams) -> float | None:
+def _levels(
+    side: str,
+    anchor: float,
+    params: PositionParams,
+    or_high: float,
+    or_low: float,
+) -> tuple[float, float, float] | None:
+    """Stop, target, and distance for one anchor price.
+
+    ``or_opposite`` keeps the stop on the far side of the opening range.
+    ``fixed`` places the stop ``stop_points`` away from ``anchor``. The
+    target is ``target_r`` times that distance from the same anchor.
+    """
+
     if params.stop_mode == "or_opposite":
-        return signal.or_low if signal.side == "long" else signal.or_high
-    if params.stop_points is None or params.stop_points <= 0:
+        stop = or_low if side == "long" else or_high
+    elif params.stop_points is None or params.stop_points <= 0:
         return None
-    if signal.side == "long":
-        return signal.price - params.stop_points
-    return signal.price + params.stop_points
+    elif side == "long":
+        stop = anchor - params.stop_points
+    else:
+        stop = anchor + params.stop_points
+    distance = abs(anchor - stop)
+    if side == "long":
+        target = anchor + params.target_r * distance
+    else:
+        target = anchor - params.target_r * distance
+    return stop, target, distance

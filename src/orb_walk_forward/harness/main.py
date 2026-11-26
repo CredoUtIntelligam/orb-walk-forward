@@ -4,6 +4,12 @@ Loop, per released bar: log the bar, let the sim broker work, then evaluate
 the signal and submit a bracket if one fires. A bracket never fills on its
 own signal bar (the broker waits for a later start).
 
+At the cash close, the first released bar at or after 15:00 CT flattens
+every open paper position through ``SimBroker.flatten_all`` at that bar's
+open, and cancels brackets that have not filled. The flatten is an order,
+a fill, and a ``cash_close`` event. Later bars that session are not traded.
+Shutdown flattening is separate and still runs when the process stops.
+
 A heartbeat is an info log plus a ``heartbeats`` row every ``heartbeat_every``
 released bars, and whenever ``heartbeat_seconds`` of wall time has passed at
 a bar boundary. A silent socket does not heartbeat until the next bar or a
@@ -27,13 +33,21 @@ import signal as os_signal
 import threading
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
-from .ingest import CHICAGO, BarSource, BarBuffer, DatabentoSource, ReplaySource, parse_ts
+from .ingest import (
+    CHICAGO,
+    BarSource,
+    BarBuffer,
+    DatabentoSource,
+    ReplaySource,
+    as_chicago,
+    parse_ts,
+)
 from .logger import RunLogger
 from .position import PositionParams, SimBroker
-from .signal import OpeningRangeTracker, SignalParams
+from .signal import CASH_CLOSE, OpeningRangeTracker, SignalParams
 
 _LOG = logging.getLogger(__name__)
 
@@ -74,6 +88,7 @@ def run_loop(
     run_log.log_config(dict(config or {}), seed)
     last_hb = clock()
     count = 0
+    cash_flat: set[date] = set()
 
     def shutdown() -> None:
         if done["flag"]:
@@ -112,20 +127,31 @@ def run_loop(
                 run_log.log_bar(fresh)
                 if status != "released":
                     continue
-                seen_updates = len(broker.level_updates)
-                for fill in broker.on_bar(fresh):
-                    run_log.log_fill(fill)
-                    run_log.log_order(broker.order(fill.order_id))
-                for update in broker.level_updates[seen_updates:]:
-                    run_log.log_level_update(update)
-                    run_log.log_order(broker.order(update.stop_order_id))
-                    run_log.log_order(broker.order(update.target_order_id))
-                signal = tracker.on_bar(fresh)
-                if signal is not None:
-                    _LOG.info("signal %s %s", signal.side, signal.ts.isoformat())
-                    run_log.log_signal(signal)
-                    for order in broker.submit_bracket(signal, position_params):
+                local = as_chicago(fresh.ts)
+                if local.time() >= CASH_CLOSE and local.date() not in cash_flat:
+                    cash_flat.add(local.date())
+                    for fill in broker.flatten_all(fresh.open, fresh.ts):
+                        run_log.log_fill(fill)
+                        run_log.log_order(broker.order(fill.order_id))
+                    for order in broker.all_orders():
                         run_log.log_order(order)
+                    run_log.event(fresh.ts, "cash_close", "flatten_all")
+                    _LOG.info("cash close flatten %s", fresh.ts.isoformat())
+                if local.time() < CASH_CLOSE:
+                    seen_updates = len(broker.level_updates)
+                    for fill in broker.on_bar(fresh):
+                        run_log.log_fill(fill)
+                        run_log.log_order(broker.order(fill.order_id))
+                    for update in broker.level_updates[seen_updates:]:
+                        run_log.log_level_update(update)
+                        run_log.log_order(broker.order(update.stop_order_id))
+                        run_log.log_order(broker.order(update.target_order_id))
+                    signal = tracker.on_bar(fresh)
+                    if signal is not None:
+                        _LOG.info("signal %s %s", signal.side, signal.ts.isoformat())
+                        run_log.log_signal(signal)
+                        for order in broker.submit_bracket(signal, position_params):
+                            run_log.log_order(order)
                 count += 1
                 now = clock()
                 bar_due = heartbeat_every > 0 and count % heartbeat_every == 0

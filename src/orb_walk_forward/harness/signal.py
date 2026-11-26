@@ -4,7 +4,8 @@ Assumptions
 -----------
 * One session is one America/Chicago calendar date. Bars before the RTH
   open (08:30 CT, equal to 09:30 America/New_York) are ignored. This
-  skeleton does not model the Sunday reopen or a forced flat at 15:00 CT.
+  skeleton does not model the Sunday reopen. The paper runner, not this
+  tracker, flattens open positions at the 15:00 CT cash close.
 * The opening range is the high and low of the observed one-minute bars
   whose start lies in ``[08:30, 08:30 + or_minutes)``. That is the first
   15 or 30 minutes of RTH, including the 08:30 bar. ``or_minutes`` must
@@ -44,6 +45,7 @@ from .ingest import CHICAGO, Bar, as_chicago
 
 Side = Literal["long", "short"]
 RTH_OPEN = time(8, 30)
+CASH_CLOSE = time(15, 0)
 
 
 @dataclass(frozen=True)

@@ -332,6 +332,45 @@ def test_rebuild_levels_are_logged(tmp_path: Path) -> None:
     assert 114.0 in target_prices and 118.0 in target_prices
 
 
+def test_cash_close_flattens_open_position_once(tmp_path: Path) -> None:
+    bars = opening_range() + [
+        bar_at(8, 45, 100, 104, 99, 103),
+        bar_at(8, 46, 103, 104, 100, 102),
+        bar_at(8, 47, 102, 103, 101, 102.5),
+        bar_at(14, 59, 103, 104, 102, 103),
+        bar_at(15, 0, 110, 111, 109, 110.5),
+        bar_at(15, 1, 110, 112, 109, 111),
+    ]
+    broker, conn = run_bars(tmp_path, bars)
+    assert broker.position_qty() == 0
+    fills = [tuple(row) for row in conn.execute("select kind, qty, price from fills order by id")]
+    assert ("entry", 10, 102.0) in fills
+    assert fills.count(("flatten", 10, 110.0)) == 1
+    assert conn.execute("select count(*) from events where kind='cash_close'").fetchone()[0] == 1
+    assert conn.execute("select count(*) from events where kind='shutdown'").fetchone()[0] == 1
+    assert conn.execute(
+        "select count(*) from orders where kind='flatten' and status='filled'"
+    ).fetchone()[0] >= 1
+    assert conn.execute("select count(*) from signals").fetchone()[0] == 1
+
+
+def test_cash_close_cancels_a_bracket_that_has_not_filled(tmp_path: Path) -> None:
+    bars = opening_range() + [
+        bar_at(8, 45, 100, 104, 99, 103),
+        bar_at(8, 46, 103, 104, 100, 102),
+        bar_at(15, 0, 110, 111, 109, 110),
+    ]
+    broker, conn = run_bars(tmp_path, bars)
+    assert broker.position_qty() == 0
+    assert conn.execute("select count(*) from fills").fetchone()[0] == 0
+    statuses = [
+        row[0]
+        for row in conn.execute("select status from orders where kind='entry' order by id")
+    ]
+    assert statuses[-1] == "cancelled"
+    assert conn.execute("select count(*) from events where kind='cash_close'").fetchone()[0] == 1
+
+
 def test_flatten_all_cancels_pending_and_closes_open() -> None:
     pending = SimBroker()
     pending.submit_bracket(long_signal(), PAPER)

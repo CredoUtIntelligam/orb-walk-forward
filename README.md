@@ -9,6 +9,7 @@ Build a robust, reproducible walk-forward framework for ORB variants (range leng
 
 ## Structure
 - `src/` — Core Python modules for data loading, ORB signal generation, walk-forward engine, metrics.
+- `src/orb_walk_forward/harness/` — Paper/simulation harness for a frozen ORB spec. No live orders.
 - `notebooks/` — Exploratory analysis and result visualization.
 - `results/` — Walk-forward outputs (CSV, plots, summaries). Gitignored large files.
 - `templates/` — Bot descriptions, prompt examples, and orchestration notes.
@@ -24,6 +25,21 @@ Typical loop:
 3. Orchestrator reviews progress periodically and suggests one improvement to keep the work on track and self-improving.
 
 See `templates/` for bot description drafts and example prompts.
+
+## Paper harness
+
+Research-only skeleton. It replays or reads one-minute bars, builds a 15- or 30-minute RTH opening range, and simulates a break-then-retest bracket. `SimBroker` is the only broker that can accept orders. `IbkrMarketDataStub` raises `NotImplementedError` for orders and is not a live data feed. The optional Databento key is read from `DATABENTO_API_KEY` and is never logged. Replay does not need it.
+
+```bash
+PYTHONPATH=src python -m orb_walk_forward.harness.main \
+  --replay bars.csv --or-minutes 30 --db run.sqlite
+```
+
+CSV columns are `ts,open,high,low,close,volume`. Naive timestamps are America/Chicago. RTH open is 08:30 CT (09:30 ET). Databento `ts_event` is the bar start. A missing minute is logged as a gap and is not forward-filled. Assumptions and parameters are in the harness module docstrings.
+
+```bash
+python -m pytest
+```
 
 ## Notes
 - Keep data out of git (use Databento, local caches, or secure storage).

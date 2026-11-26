@@ -6,7 +6,9 @@ Assumptions
   The RTH open is 08:30 CT, which is 09:30 America/New_York.
 * Databento ``ohlcv-1m`` ``ts_event`` is the bar **start**, not the close.
 * Inputs are one-minute bars. A hole longer than one minute is a gap: it is
-  logged and never forward-filled.
+  logged (a warning here, and an ``events`` row from the runner) and never
+  forward-filled. A gap inside the opening window does not invalidate that
+  session. The signal uses the bars that arrived.
 * The first sighting of a timestamp wins. A reconnect or replay that resends
   a bar cannot double-count it. A bar that arrives after a later timestamp
   was already released is stored for audit but is not released again, so it
@@ -21,8 +23,10 @@ Assumptions
 Parameters
 ----------
 ``symbol``, ``dataset`` (default ``GLBX.MDP3``), ``schema`` (``ohlcv-1m``),
-``stype_in``, ``start``, ``end``, ``live``, ``max_backoff_s``, ``max_retries``
-(``None`` retries until the process stops).
+``stype_in`` (default ``raw_symbol``; this is the Databento symbology used
+for a specific contract, not a continuous parent), ``start``, ``end``,
+``live``, ``max_backoff_s``, ``max_retries`` (``None`` retries until the
+process stops).
 """
 
 from __future__ import annotations
@@ -182,9 +186,11 @@ def _load_databento() -> Any:
 class DatabentoSource:
     """Live or historical ``ohlcv-1m`` via the optional ``databento`` SDK.
 
-    ``client_factory`` and ``sleep`` exist so tests can simulate a disconnect
-    without the SDK and without sleeping. The factory receives the resume
-    timestamp (the last released bar start, or the configured start).
+    Symbology defaults to ``raw_symbol`` (one outright contract). Pass
+    ``stype_in`` to override it. ``client_factory`` and ``sleep`` exist so
+    tests can simulate a disconnect without the SDK and without sleeping.
+    The factory receives the resume timestamp (the last released bar start,
+    or the configured start).
     """
 
     def __init__(

@@ -10,11 +10,13 @@ Assumptions
   whose start lies in ``[08:30, 08:30 + or_minutes)``. That is the first
   15 or 30 minutes of RTH, including the 08:30 bar. ``or_minutes`` must
   be 15 or 30.
-* A missing minute is not filled. The range completes when ``or_minutes``
-  in-window bars have been seen, or when the first bar at/after the window
-  end arrives, whichever comes first. If the window contained no bars, the
-  session produces no signal. Once the range is complete it does not change;
-  a late in-window bar is ignored.
+* A missing minute is not filled and does not invalidate the session. The
+  range is the high and low of the bars that actually arrived. It completes
+  when ``or_minutes`` in-window bars have been seen, or when the first bar
+  at/after the window end arrives, whichever comes first. If the window
+  contained no bars, the session produces no signal. The runner logs each
+  gap as a warning and as an ``events`` row with kind ``gap``. Once the
+  range is complete it does not change; a late in-window bar is ignored.
 * A duplicate timestamp is ignored, so a replay cannot widen the range.
 
 Trigger
@@ -30,9 +32,10 @@ After the range is complete, long side:
 The short side is the mirror: a close strictly below the OR low, then a
 later bar whose high touches the OR low and whose close is back below it.
 
-At most one signal per side per session. The two sides are independent, so
-one session may emit one long and one short. Nothing here optimizes or
-filters. There is no signal on the forming range.
+At most one signal per side per session. The sides do not suppress each
+other: one session may emit one long and one short, and both brackets may
+be open at the same time. Nothing here optimizes or filters. There is no
+signal on the forming range.
 """
 
 from __future__ import annotations

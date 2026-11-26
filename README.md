@@ -35,7 +35,9 @@ PYTHONPATH=src python -m orb_walk_forward.harness.main \
   --replay bars.csv --or-minutes 30 --db run.sqlite
 ```
 
-CSV columns are `ts,open,high,low,close,volume`. Naive timestamps are America/Chicago. RTH open is 08:30 CT (09:30 ET). Databento `ts_event` is the bar start. A missing minute is logged as a gap and is not forward-filled. Assumptions and parameters are in the harness module docstrings.
+CSV columns are `ts,open,high,low,close,volume`. Naive timestamps are America/Chicago. RTH open is 08:30 CT (09:30 ET). The runner flattens open paper positions on the first bar at or after 15:00 CT, at that bar's open, and logs the flatten as an order, a fill, and a `cash_close` event. Shutdown flattening still runs if the process stops earlier. Databento `ts_event` is the bar start. The Databento symbology default is `raw_symbol`.
+
+A missing minute is logged (a warning and a `gap` event) and is not forward-filled. A gap inside the opening window does not invalidate the session; the range uses the bars that arrived. Long and short are independent: at most one signal per side, and both brackets may be open in the same session. When the entry fills, the stop and target are rebuilt from that fill. The original size is kept even if the new stop distance would allow fewer contracts. Assumptions and parameters are in the harness module docstrings.
 
 ```bash
 python -m pytest

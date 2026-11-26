@@ -20,6 +20,9 @@ build/
 data/
 *.parquet
 *.csv
+*.sqlite
+*.sqlite3
+*.db
 !results/.gitkeep
 results/*.csv
 results/*.png
